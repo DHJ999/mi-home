@@ -3,20 +3,119 @@ import { VideoRTC } from './video-rtc.js';
 customElements.define('video-rtc', VideoRTC);
 
 const $ = (id) => document.getElementById(id);
+const H = 3600;
+const M = 60;
+const DAY = 86400;
+const MAX_WINDOW = 255;
+// 存储卡的片段之间常有 3–5 秒抖动，按 30 秒容差并成连续录像段
+const GAP_TOLERANCE = 30;
+
+const pad = (n) => String(n).padStart(2, '0');
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+const ICON_PLAY = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></svg>';
+const ICON_PAUSE = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="5" width="3.6" height="14" rx="1" fill="currentColor"/><rect x="13.4" y="5" width="3.6" height="14" rx="1" fill="currentColor"/></svg>';
+const ICON_FS = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 9V5.5A1.5 1.5 0 0 1 5.5 4H9M15 4h3.5A1.5 1.5 0 0 1 20 5.5V9M20 15v3.5a1.5 1.5 0 0 1-1.5 1.5H15M9 20H5.5A1.5 1.5 0 0 1 4 18.5V15"/></svg>';
+const ICON_VOLUME = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.2L12 5.8v12.4L7.2 14.5H4z"/><path d="M15.5 9.2a4.2 4.2 0 0 1 0 5.6"/><path d="M18.2 6.6a7.8 7.8 0 0 1 0 10.8"/></svg>';
+const ICON_MUTE = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9.5h3.2L12 5.8v12.4L7.2 14.5H4z"/><path d="M16.2 9.8l4.6 4.6"/><path d="M20.8 9.8l-4.6 4.6"/></svg>';
 
 const loginView = $('loginView');
 const homeView = $('homeView');
 const playerView = $('playerView');
+const liveView = $('liveView');
+const replayView = $('replayView');
 const cameraGrid = $('cameraGrid');
 const emptyBox = $('emptyBox');
-const shell = $('videoShell');
-const overlay = $('videoOverlay');
-const overlayText = $('overlayText');
+const videoGrid = $('videoGrid');
 const streamState = $('streamState');
+const motorButtons = [...document.querySelectorAll('[data-direction]')];
+const stage = $('stage');
+const stageCard = $('stageCard');
+const track = $('track');
 
 let cameras = [];
 let current = null;
-let player = null;
+let players = [];
+let motorBusy = false;
+let viewGeneration = 0;
+let mode = 'live';
+let liveSuspended = false;
+
+const replay = {
+  dateIndex: 0,
+  time: 0,
+  anchor: 0,
+  zoom: '1h',
+  playing: false,
+  loading: false,
+  dragging: false,
+  dragWasPlaying: false,
+  dragOrigin: 0,
+  ended: false,
+  endedNext: null,
+  error: null,
+  errorAction: 'play',
+  muted: true,
+  player: null,
+  requestController: null,
+  opToken: 0,
+  switching: false,
+  playFrom: 0,
+  wallStart: 0,
+  windowEnd: 0,
+  loadTimer: null,
+  statusSecond: -1,
+};
+
+let replayDates = [];
+let replayListAt = 0;
+const replayMemory = new Map();
+
+function fmt(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = new Date(sec * 1000);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function mmss(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  return `${pad(Math.floor(sec / M))}:${pad(sec % M)}`;
+}
+
+function dur(sec) {
+  const h = Math.floor(sec / H);
+  const m = Math.round((sec % H) / M);
+  return h ? `${h} 小时 ${m} 分` : `${m} 分钟`;
+}
+
+function dateKeyOf(sec) {
+  const d = new Date(sec * 1000);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function dayStartOfKey(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return Math.floor(new Date(y, m - 1, d).getTime() / 1000);
+}
+
+function weekdayOf(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return '周' + '日一二三四五六'[new Date(y, m - 1, d).getDay()];
+}
+
+function replaySupported() {
+  return ['isa.camera.hlmax', 'isa.camera.hlc7'].includes(current?.model);
+}
+
+function mainIsLive() {
+  return players.some((entry) => String(entry.channel) === '0' && entry.state === 'playing');
+}
+
+function withContentType(body) {
+  return { 'content-type': 'application/json', body: JSON.stringify(body) };
+}
+
+// ---------- 登录 / 设备列表 ----------
 
 function show(view) {
   loginView.hidden = view !== 'login';
@@ -266,68 +365,1277 @@ $('refreshBtn').onclick = async () => {
   }
 };
 
-function setOverlay(text, spinner = true) {
-  overlay.hidden = !text;
-  overlay.querySelector('.spinner').style.display = spinner ? '' : 'none';
-  overlayText.textContent = text || '';
-}
+// ---------- 实时画面 ----------
 
-function destroyPlayer() {
-  if (!player) return;
-  player.ondisconnect();
-  player.remove();
-  player = null;
-}
-
-async function openPlayer(cam) {
-  current = cam;
-  $('playerTitle').textContent = cam.name || '摄像头';
-  $('playerMeta').textContent = cam.model || '';
-  show('player');
-  await connect();
-}
-
-async function connect() {
-  destroyPlayer();
-  setOverlay('正在通过小米云端连接摄像头，首次大约 5～20 秒…');
-  streamState.textContent = '连接云端通道…';
-  streamState.className = 'pill';
-  try {
-    const r = await api('/api/stream', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ did: current.did }),
-    });
-    streamState.textContent = '建立播放通道…';
-    player = document.createElement('video-rtc');
-    player.mode = 'webrtc,mse';
-    // 播放器和本机服务在同一台电脑上，不需要外部 STUN 服务器
-    player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [], sdpSemantics: 'unified-plan' };
-    shell.prepend(player);
-    player.video.addEventListener('playing', () => {
-      streamState.textContent = '直播中';
-      streamState.className = 'pill on';
-      setOverlay('');
-    });
-    player.src = r.ws;
-  } catch (e) {
-    setOverlay('没能打开这台摄像头：\n' + e.message, false);
-    streamState.textContent = '失败';
-    streamState.className = 'pill off';
+function updatePlayerState() {
+  if (mode === 'replay') { updateReplayChrome(); return; }
+  const playing = players.filter((entry) => entry.state === 'playing').length;
+  const failed = players.filter((entry) => entry.state === 'error').length;
+  streamState.textContent = playing ? `${playing}/${players.length} 路直播中`
+    : players.some((entry) => entry.state === 'connecting') ? '连接中…'
+      : failed === players.length && players.length ? '连接失败' : '播放已停止';
+  streamState.className = 'pill' + (playing ? ' on' : failed === players.length && players.length ? ' off' : '');
+  $('reloadBtn').disabled = players.some((entry) => entry.state === 'connecting');
+  for (const button of motorButtons) {
+    button.disabled = motorBusy || !current?.ptz || !mainIsLive();
   }
 }
 
-$('reloadBtn').onclick = () => { if (current) connect(); };
+function setLensState(entry, state, text) {
+  entry.state = state;
+  entry.status.textContent = state === 'playing' ? '直播中'
+    : state === 'error' ? '失败' : '连接中…';
+  entry.status.className = 'pill' + (state === 'playing' ? ' on' : state === 'error' ? ' off' : '');
+  entry.overlay.hidden = state === 'playing';
+  entry.overlay.querySelector('.spinner').hidden = state !== 'connecting';
+  entry.overlay.querySelector('p').textContent = text || '';
+  entry.retry.disabled = state === 'connecting';
+  updatePlayerState();
+}
+
+function stopLens(entry) {
+  entry.controller?.abort();
+  entry.controller = null;
+  clearTimeout(entry.requestTimer);
+  clearTimeout(entry.playTimer);
+  entry.requestTimer = entry.playTimer = null;
+  if (entry.player) {
+    clearTimeout(entry.player.disconnectTID);
+    clearTimeout(entry.player.reconnectTID);
+    entry.player.disconnectTID = entry.player.reconnectTID = 0;
+    entry.player.ondisconnect();
+    entry.player.remove();
+    entry.player = null;
+  }
+}
+
+function destroyPlayer() {
+  for (const entry of players) stopLens(entry);
+  players = [];
+  videoGrid.replaceChildren();
+}
+
+function openPlayer(cam) {
+  closePlayer();
+  current = cam;
+  mode = 'live';
+  liveSuspended = false;
+  $('playerTitle').textContent = cam.name || '摄像头';
+  $('motorPanel').hidden = !cam.ptz;
+  $('motorStatus').textContent = '连接镜头 1 后可发送转动指令，点击后请等待画面变化。';
+  videoGrid.classList.toggle('dual', cam.lenses.length === 2);
+  $('modeReplayBtn').disabled = !replaySupported();
+  $('modeReplayBtn').title = replaySupported() ? '' : '这台机型的存储卡回放尚未接通';
+  $('lensChip').textContent = cam.model === 'isa.camera.hlmax' ? '镜头 1 · 镜头 2 暂不可回放' : '镜头 1';
+  $('replayHint').textContent = '橙色为有录像时段。拖动只预览时间，松手才重新建立播放流（实际约 2–4 秒）；播放到窗口末尾会自动接续下一段。'
+    + (cam.model === 'isa.camera.hlmax' ? ' 镜头 2 的存储卡回放尚未接通，回放只使用镜头 1。' : '');
+  players = cam.lenses.map((lens) => {
+    const panel = document.createElement('section');
+    panel.className = 'lens-panel';
+    panel.innerHTML = `<div class="lens-head"><h3></h3><span class="pill" role="status"></span><button class="ghost lens-retry" type="button">重试此镜头</button></div>
+      <div class="video-shell"><div class="video-overlay"><div class="spinner"></div><p></p></div></div>`;
+    panel.querySelector('h3').textContent = lens.label;
+    const entry = {
+      label: lens.label, channel: lens.channel, state: 'connecting', player: null, controller: null,
+      playTimer: null, requestTimer: null,
+      shell: panel.querySelector('.video-shell'), overlay: panel.querySelector('.video-overlay'),
+      status: panel.querySelector('.pill'), retry: panel.querySelector('.lens-retry'),
+    };
+    entry.retry.onclick = () => connectLens(entry);
+    videoGrid.appendChild(panel);
+    return entry;
+  });
+  setModeChrome();
+  show('player');
+  players.forEach(connectLens);
+}
+
+async function connectLens(entry) {
+  if (!current || !players.includes(entry)) return;
+  stopLens(entry);
+  const camera = current;
+  const generation = viewGeneration;
+  const controller = new AbortController();
+  entry.controller = controller;
+  const active = () => generation === viewGeneration && current === camera && entry.controller === controller;
+  entry.requestTimer = setTimeout(() => controller.abort(), 150000);
+  setLensState(entry, 'connecting', '正在连接这个镜头，首次通常需要 5～20 秒…');
+  try {
+    const r = await api('/api/stream', {
+      method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ did: camera.did, channel: entry.channel }),
+    });
+    if (!active()) return;
+    const player = document.createElement('video-rtc');
+    entry.player = player;
+    player.mode = 'webrtc,mse';
+    player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [], sdpSemantics: 'unified-plan' };
+    entry.shell.prepend(player);
+    player.video.addEventListener('playing', () => {
+      if (!active()) return;
+      clearTimeout(entry.playTimer);
+      setLensState(entry, 'playing');
+    });
+    player.video.addEventListener('error', () => {
+      if (!active()) return;
+      if (player.wsState === WebSocket.CLOSED && player.pcState === WebSocket.CLOSED) return;
+      setLensState(entry, 'error', '画面播放失败，请重试此镜头。');
+      stopLens(entry);
+    });
+    entry.playTimer = setTimeout(() => {
+      if (!active()) return;
+      setLensState(entry, 'error', '尚未收到这个镜头的画面，请确认摄像头网络正常，再单独重试。');
+      stopLens(entry);
+    }, 45000);
+    player.src = r.ws;
+  } catch (e) {
+    if (active()) {
+      setLensState(entry, 'error', e.name === 'AbortError' ? '连接超时，请重试此镜头。' : e.message);
+      stopLens(entry);
+    }
+  } finally {
+    clearTimeout(entry.requestTimer);
+  }
+}
+
+function waitLensPlaying(entry, ms) {
+  return new Promise((resolve, reject) => {
+    const end = Date.now() + ms;
+    const timer = setInterval(() => {
+      if (!players.includes(entry)) { clearInterval(timer); reject(new Error('页面已关闭')); return; }
+      if (entry.state === 'playing') { clearInterval(timer); resolve(); return; }
+      if (entry.state === 'error') { clearInterval(timer); reject(new Error('实时画面连接失败，无法读取存储卡录像')); return; }
+      if (Date.now() > end) { clearInterval(timer); reject(new Error('连接摄像头超时，请返回实时后重试')); }
+    }, 250);
+  });
+}
+
+function canMoveMotor() {
+  return Boolean(current?.ptz) && !motorBusy && mode === 'live' && mainIsLive();
+}
+
+async function moveMotor(direction) {
+  if (!canMoveMotor()) return;
+  const camera = current;
+  const generation = viewGeneration;
+  const active = () => current === camera && viewGeneration === generation;
+  motorBusy = true;
+  updatePlayerState();
+  $('motorStatus').textContent = '正在发送云台指令…';
+  try {
+    await api('/api/motor', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ did: camera.did, direction }),
+    });
+    if (active()) $('motorStatus').textContent = '已发送转动指令，请观察画面；直播可能稍有延迟。';
+  } catch (e) {
+    if (active()) $('motorStatus').textContent = e.message;
+  } finally {
+    if (active()) {
+      motorBusy = false;
+      updatePlayerState();
+    }
+  }
+}
+
+for (const button of motorButtons) {
+  button.onclick = () => {
+    if (button.disabled) return;
+    moveMotor(button.dataset.direction);
+  };
+}
+
+$('reloadBtn').onclick = () => {
+  if (!current) return;
+  if (mode === 'replay') {
+    if (!dateInfo()) startReplaySession();
+    else playReplayAt(replay.time, { text: '正在重新定位…' });
+  } else {
+    players.forEach(connectLens);
+  }
+};
 
 function closePlayer() {
+  viewGeneration++;
+  if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  if (mode === 'replay') saveMemory();
+  mode = 'live';
+  replay.opToken++;
+  stopReplayStream();
+  stopReplayFeed();
+  replay.loading = false;
+  replay.playing = false;
+  replay.dragging = false;
+  replay.ended = false;
+  replay.error = null;
+  replay.windowEnd = 0;
+  clearFreezeFrame();
+  hideLoading();
+  hideError();
+  $('pauseLayer').hidden = true;
+  $('scrubLayer').hidden = true;
+  $('track').classList.remove('invalid');
+  stage.classList.remove('scrubbing', 'is-paused');
+  replayDates = [];
+  replayListAt = 0;
+  liveSuspended = false;
   destroyPlayer();
   current = null;
+  motorBusy = false;
+  replayView.hidden = true;
+  liveView.hidden = false;
+  $('dateRow').replaceChildren();
+  $('runs').replaceChildren();
+  $('segTicks').replaceChildren();
+  $('gapLabels').replaceChildren();
+  $('ovRuns').replaceChildren();
+  $('ruler').replaceChildren();
+  $('playhead').style.left = '0%';
+  $('motorPanel').hidden = true;
   if (!$('logoutBtn').hidden) show('home');
 }
 $('closePlayer').onclick = closePlayer;
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !playerView.hidden) closePlayer();
+// ---------- 回放：数据与时间轴 ----------
+
+function dateInfo() {
+  return replayDates[replay.dateIndex] || null;
+}
+
+function buildReplayDates(items) {
+  const buckets = new Map();
+  for (const item of items) {
+    if (!Number.isInteger(item.start) || item.start <= 0) continue;
+    if (!Number.isInteger(item.duration) || item.duration <= 0 || item.duration > MAX_WINDOW) continue;
+    const key = dateKeyOf(item.start);
+    if (!buckets.has(key)) buckets.set(key, []);
+    buckets.get(key).push({ start: item.start, duration: item.duration });
+  }
+  const dates = [];
+  for (const [key, segments] of buckets) {
+    segments.sort((a, b) => a.start - b.start);
+    const runs = [];
+    for (const segment of segments) {
+      const end = segment.start + segment.duration;
+      const last = runs[runs.length - 1];
+      if (last && segment.start <= last[1] + GAP_TOLERANCE) {
+        last[1] = Math.max(last[1], end);
+      } else {
+        runs.push([segment.start, end]);
+      }
+    }
+    dates.push({
+      key,
+      dayStart: dayStartOfKey(key),
+      segments,
+      runs,
+      total: runs.reduce((n, [a, b]) => n + (b - a), 0),
+    });
+  }
+  dates.sort((a, b) => (a.key < b.key ? 1 : -1));
+  return dates;
+}
+
+function findRun(d, t) {
+  const run = d.runs.find(([a, b]) => t >= a && t < b) || null;
+  return run;
+}
+
+function recordedAt(d, t) {
+  return !!findRun(d, t);
+}
+
+function segmentAt(d, t) {
+  let lo = 0;
+  let hi = d.segments.length - 1;
+  let best = null;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const segment = d.segments[mid];
+    if (segment.start <= t) {
+      best = segment;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return best && t < best.start + best.duration ? best : null;
+}
+
+function segmentEnd(segment) {
+  return segment.start + segment.duration;
+}
+
+function nearestSegment(d, t) {
+  let best = null;
+  let bestDelta = Infinity;
+  for (const segment of d.segments) {
+    const candidate = t < segment.start ? segment.start
+      : t >= segmentEnd(segment) ? segmentEnd(segment) - 0.2 : t;
+    const delta = Math.abs(candidate - t);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      best = { segment, time: candidate };
+    }
+  }
+  return best;
+}
+
+function resolveSeek(d, t) {
+  const time = clamp(t, d.dayStart, d.dayStart + DAY - 1);
+  const segment = segmentAt(d, time);
+  if (segment) return { segment, time };
+  const near = nearestSegment(d, time);
+  if (!near) return null;
+  return { segment: near.segment, time: near.time };
+}
+
+function nextSegment(d, t) {
+  const inside = segmentAt(d, t);
+  if (inside) return inside;
+  const next = d.segments.find((segment) => segment.start >= t);
+  if (next && next.start - t <= GAP_TOLERANCE + 1) return next;
+  return null;
+}
+
+function nextRunStart(d, t) {
+  let best = null;
+  for (const [a] of d.runs) {
+    if (a >= t && (best === null || a < best)) best = a;
+  }
+  return best;
+}
+
+function defaultPosition(d) {
+  if (!d.runs.length) return d.dayStart;
+  const run = d.runs[d.runs.length - 1];
+  const target = Math.max(run[0], run[1] - 10 * M);
+  return resolveSeek(d, target)?.time ?? run[0];
+}
+
+function windowFor(d, segment, time) {
+  const offset = Math.max(0, Math.floor(time - segment.start));
+  const run = findRun(d, segment.start) || [segment.start, segmentEnd(segment)];
+  const runEnd = Math.max(segmentEnd(segment), run[1]);
+  const duration = Math.min(MAX_WINDOW, Math.max(offset + 1, Math.round(runEnd - segment.start)));
+  return { offset, duration, end: segment.start + duration };
+}
+
+function viewRange() {
+  const d = dateInfo();
+  if (!d) return { start: 0, span: DAY };
+  const span = replay.zoom === 'day' ? DAY : replay.zoom === '6h' ? 6 * H : H;
+  if (replay.zoom === 'day') return { start: d.dayStart, span: DAY };
+  const start = clamp(replay.anchor - span / 2, d.dayStart, d.dayStart + DAY - span);
+  return { start, span };
+}
+
+function hourCoverage(d, hour) {
+  const from = d.dayStart + hour * H;
+  const to = from + H;
+  let sec = 0;
+  for (const [a, b] of d.runs) sec += Math.max(0, Math.min(b, to) - Math.max(a, from));
+  return clamp(sec / H, 0, 1);
+}
+
+function showToast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+function showLoading(text) {
+  $('loadingText').textContent = text;
+  $('loadingLayer').hidden = false;
+  $('scrubLayer').hidden = true;
+  $('pauseLayer').hidden = true;
+  $('errorLayer').hidden = true;
+}
+
+function hideLoading() {
+  $('loadingLayer').hidden = true;
+}
+
+function showError(text) {
+  $('errorText').textContent = text;
+  $('errorLayer').hidden = false;
+  $('loadingLayer').hidden = true;
+  $('pauseLayer').hidden = true;
+}
+
+function hideError() {
+  $('errorLayer').hidden = true;
+}
+
+function paintRuns(container, range, className, d) {
+  container.replaceChildren();
+  const frag = document.createDocumentFragment();
+  for (const [a, b] of d.runs) {
+    const start = Math.max(a, range.start);
+    const end = Math.min(b, range.start + range.span);
+    if (end <= start) continue;
+    const el = document.createElement('div');
+    el.className = className;
+    el.style.left = ((start - range.start) / range.span * 100) + '%';
+    el.style.width = Math.max(0.08, (end - start) / range.span * 100) + '%';
+    el.title = `${fmt(a)} – ${fmt(b)}`;
+    frag.append(el);
+  }
+  container.append(frag);
+}
+
+function renderRuler(range, d) {
+  const ruler = $('ruler');
+  ruler.replaceChildren();
+  const minor = replay.zoom === 'day' ? H : replay.zoom === '6h' ? 30 * M : 5 * M;
+  const major = replay.zoom === 'day' ? 3 * H : replay.zoom === '6h' ? H : 10 * M;
+  const begin = d.dayStart + Math.ceil((range.start - d.dayStart) / minor) * minor;
+  for (let t = begin; t <= range.start + range.span + 0.5; t += minor) {
+    const pct = (t - range.start) / range.span * 100;
+    if (pct < -0.5 || pct > 100.5) continue;
+    const isMajor = (t - d.dayStart) % major === 0;
+    const tick = document.createElement('span');
+    tick.className = 'r-tick' + (isMajor ? ' major' : '');
+    tick.style.left = pct + '%';
+    ruler.append(tick);
+    if (isMajor) {
+      const label = document.createElement('span');
+      label.className = 'r-label';
+      label.textContent = t >= d.dayStart + DAY ? '24:00' : fmt(t).slice(0, 5);
+      label.style.left = pct + '%';
+      label.style.transform = pct > 92 ? 'translateX(-100%)' : pct < 4 ? 'none' : 'translateX(-50%)';
+      ruler.append(label);
+    }
+  }
+}
+
+function renderSegmentTicks(range, d) {
+  const layer = $('segTicks');
+  layer.replaceChildren();
+  if (replay.zoom !== '1h') return;
+  const begin = d.dayStart + Math.ceil((range.start - d.dayStart) / M) * M;
+  for (let t = begin; t < range.start + range.span; t += M) {
+    if (!segmentAt(d, t)) continue;
+    const el = document.createElement('span');
+    el.className = 'seg-tick';
+    el.style.left = ((t - range.start) / range.span * 100) + '%';
+    layer.append(el);
+  }
+}
+
+function renderGaps(range, d) {
+  const layer = $('gapLabels');
+  layer.replaceChildren();
+  const gaps = [];
+  let prev = d.dayStart;
+  for (const [a, b] of d.runs) {
+    if (a > prev) gaps.push([prev, a]);
+    prev = Math.max(prev, b);
+  }
+  if (prev < d.dayStart + DAY) gaps.push([prev, d.dayStart + DAY]);
+  const width = track.clientWidth || 900;
+  for (const [a, b] of gaps) {
+    const start = Math.max(a, range.start);
+    const end = Math.min(b, range.start + range.span);
+    if (end <= start) continue;
+    if ((end - start) / range.span * width < 48) continue;
+    const el = document.createElement('span');
+    el.className = 'gap-label';
+    el.textContent = '无录像';
+    el.title = `${fmt(a)} – ${fmt(b)} 无录像`;
+    el.style.left = ((start + end) / 2 - range.start) / range.span * 100 + '%';
+    layer.append(el);
+  }
+}
+
+function placePlayhead() {
+  const d = dateInfo();
+  if (!d) return;
+  const range = viewRange();
+  const pct = clamp((replay.time - range.start) / range.span, 0, 1);
+  $('playhead').style.left = pct * 100 + '%';
+  $('ovHead').style.left = clamp((replay.time - d.dayStart) / DAY, 0, 1) * 100 + '%';
+  track.setAttribute('aria-valuenow', String(Math.round(replay.time - d.dayStart)));
+  track.setAttribute('aria-valuetext', `${fmt(replay.time)}${recordedAt(d, replay.time) ? ' 有录像' : ' 无录像'}`);
+}
+
+function renderOverviewWindow(d) {
+  const win = $('ovWindow');
+  if (replay.zoom === 'day') { win.hidden = true; return; }
+  win.hidden = false;
+  const range = viewRange();
+  win.style.left = ((range.start - d.dayStart) / DAY * 100) + '%';
+  win.style.width = (range.span / DAY * 100) + '%';
+}
+
+function renderTimeline() {
+  const d = dateInfo();
+  if (!d) return;
+  $('tlSub').textContent = `${d.key} ${weekdayOf(d.key)} · 共 ${dur(d.total)}`;
+  paintRuns($('ovRuns'), { start: d.dayStart, span: DAY }, 'ov-run', d);
+  renderOverviewWindow(d);
+  const range = viewRange();
+  renderRuler(range, d);
+  paintRuns($('runs'), range, 'run', d);
+  renderSegmentTicks(range, d);
+  renderGaps(range, d);
+  placePlayhead();
+}
+
+function renderDatePills() {
+  const row = $('dateRow');
+  row.replaceChildren();
+  const now = Math.floor(Date.now() / 1000);
+  const today = dateKeyOf(now);
+  const yesterday = dateKeyOf(now - DAY);
+  replayDates.forEach((d, index) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'date-pill';
+    b.title = `${d.key} ${weekdayOf(d.key)} · 共 ${dur(d.total)}`;
+    const top = document.createElement('span');
+    top.className = 'dp-top';
+    top.textContent = d.key === today ? '今天' : d.key === yesterday ? '昨天' : weekdayOf(d.key);
+    const dateEl = document.createElement('span');
+    dateEl.className = 'dp-date';
+    dateEl.textContent = d.key.slice(5);
+    const spark = document.createElement('span');
+    spark.className = 'spark';
+    for (let h = 0; h < 24; h++) {
+      const bar = document.createElement('i');
+      const cov = hourCoverage(d, h);
+      if (cov > 0) {
+        bar.className = 'on';
+        bar.style.opacity = String(0.35 + 0.65 * cov);
+      }
+      spark.append(bar);
+    }
+    b.append(top, dateEl, spark);
+    b.addEventListener('click', () => selectReplayDate(index));
+    row.append(b);
+  });
+  markDatePills();
+}
+
+function markDatePills() {
+  const row = $('dateRow');
+  [...row.children].forEach((b, i) => b.classList.toggle('active', i === replay.dateIndex));
+  const active = row.children[replay.dateIndex];
+  if (active) row.scrollLeft = Math.max(0, active.offsetLeft - row.offsetLeft - 8);
+}
+
+// ---------- 回放：控制器 ----------
+
+function setModeChrome() {
+  const isReplay = mode === 'replay';
+  $('modeLiveBtn').classList.toggle('active', !isReplay);
+  $('modeReplayBtn').classList.toggle('active', isReplay);
+  liveView.hidden = isReplay;
+  replayView.hidden = !isReplay;
+  $('playerMeta').textContent = current ? `${current.model || ''}${isReplay ? ' · 存储卡回放' : ' · 实时画面'}` : '';
+  $('reloadBtn').textContent = isReplay ? '重新定位' : '重新连接';
+  if (isReplay) updateReplayChrome();
+  else updatePlayerState();
+}
+
+function updateReplayChrome() {
+  if (mode !== 'replay') return;
+  $('playBtn').innerHTML = replay.playing ? ICON_PAUSE : ICON_PLAY;
+  $('playBtn').setAttribute('aria-label', replay.playing ? '暂停' : '播放');
+  $('muteBtn').innerHTML = replay.muted ? ICON_MUTE : ICON_VOLUME;
+  $('muteBtn').setAttribute('aria-label', replay.muted ? '开启声音' : '静音');
+  $('fsBtn').innerHTML = ICON_FS;
+  $('pauseLayer').hidden = replay.playing || replay.loading || replay.dragging || !!replay.error;
+  $('pauseText').textContent = replay.ended
+    ? (replay.endedNext !== null ? '本段录像已结束，可继续下一段' : '当天录像已结束')
+    : '已暂停';
+  $('bigPlay').hidden = replay.ended && replay.endedNext === null;
+  $('bigPlay').setAttribute('aria-label', replay.ended && replay.endedNext !== null ? '继续下一段' : '继续播放');
+  stage.classList.toggle('is-paused', !replay.playing && !replay.loading);
+  stage.classList.toggle('is-scrubbing', replay.dragging);
+  streamState.textContent = replay.error ? '回放失败'
+    : replay.loading ? '定位中…'
+      : replay.playing ? '回放中'
+        : replay.ended ? '已结束' : '已暂停';
+  streamState.className = 'pill' + (replay.playing ? ' on' : replay.error ? ' off' : '');
+  $('reloadBtn').disabled = replay.loading;
+}
+
+function updatePositions() {
+  if (mode !== 'replay') return;
+  const d = dateInfo();
+  $('timeNow').textContent = d ? fmt(replay.time) : '--:--:--';
+  const end = replay.windowEnd || (replay.seg ? segmentEnd(replay.seg) : 0);
+  $('timeEnd').textContent = end ? fmt(end) : '--:--:--';
+  if (!d) return;
+  $('osd').textContent = `${d.key} ${fmt(replay.time)}`;
+  placePlayhead();
+  if (replay.playing && !replay.loading && Math.floor(replay.time) !== replay.statusSecond) refreshStatus();
+}
+
+function refreshStatus() {
+  if (mode !== 'replay') return;
+  const dot = $('statusDot');
+  const remain = $('remainChip');
+  const next = $('nextRunBtn');
+  dot.classList.toggle('idle', !replay.playing);
+  if (replay.loading) {
+    $('statusText').textContent = '正在定位录像…';
+    remain.hidden = true;
+    next.hidden = true;
+    return;
+  }
+  if (replay.error) {
+    $('statusText').textContent = '定位失败 · ' + replay.error;
+    remain.hidden = true;
+    next.hidden = true;
+    return;
+  }
+  if (replay.ended) {
+    $('statusText').textContent = `本段录像已结束 · ${fmt(replay.time)}`;
+    remain.hidden = true;
+    next.hidden = replay.endedNext === null;
+    if (replay.endedNext !== null) next.textContent = `继续 ${fmt(replay.endedNext)}`;
+    return;
+  }
+  next.hidden = true;
+  if (replay.playing) {
+    $('statusText').textContent = `正在播放 · ${fmt(replay.time)} – ${fmt(replay.windowEnd)} · 镜头 1`;
+    remain.hidden = false;
+    remain.textContent = `距接续 ${mmss(replay.windowEnd - replay.time)}`;
+  } else {
+    $('statusText').textContent = `已暂停 · ${fmt(replay.time)} · 镜头 1`;
+    remain.hidden = true;
+  }
+  replay.statusSecond = Math.floor(replay.time);
+}
+
+function saveMemory() {
+  const d = dateInfo();
+  if (!current || !d) return;
+  const time = recordedAt(d, replay.time) ? replay.time : defaultPosition(d);
+  const run = findRun(d, time);
+  replayMemory.set(current.did, {
+    dateKey: d.key,
+    time: Math.floor(run ? Math.min(time, run[1] - 5) : time),
+  });
+}
+
+function freezeReplayFrame() {
+  const video = replay.player?.video;
+  if (!video || !video.videoWidth) return;
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.className = 'freeze-frame';
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0);
+    stage.querySelector('.freeze-frame')?.remove();
+    stage.insertBefore(canvas, stage.querySelector('.stage-shade'));
+  } catch {}
+}
+
+function clearFreezeFrame() {
+  stage.querySelector('.freeze-frame')?.remove();
+}
+
+// 关闭前端 WebSocket 不会释放小米 P2P，需要让本地服务删掉这个回放流
+function stopReplayFeed() {
+  if (!current) return;
+  fetch('/api/playback/stop', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ did: current.did }),
+    keepalive: true,
+  }).catch(() => {});
+}
+
+function stopReplayStream() {
+  clearTimeout(replay.loadTimer);
+  replay.loadTimer = null;
+  replay.requestController?.abort();
+  replay.requestController = null;
+  if (replay.player) {
+    const player = replay.player;
+    replay.player = null;
+    clearTimeout(player.disconnectTID);
+    clearTimeout(player.reconnectTID);
+    player.disconnectTID = player.reconnectTID = 0;
+    try { player.ondisconnect(); } catch {}
+    player.remove();
+  }
+}
+
+function maybeFollowView() {
+  if (replay.zoom === 'day') return;
+  const range = viewRange();
+  if (replay.time < range.start || replay.time >= range.start + range.span) {
+    replay.anchor = replay.time;
+    renderTimeline();
+  }
+}
+
+function replayTick() {
+  if (!replay.playing || replay.loading || replay.dragging || replay.ended || replay.error) return;
+  const t = replay.playFrom + (performance.now() - replay.wallStart) / 1000;
+  if (t >= replay.windowEnd - 0.05) {
+    replay.time = replay.windowEnd;
+    updatePositions();
+    continueReplay();
+    return;
+  }
+  replay.time = t;
+  maybeFollowView();
+  updatePositions();
+}
+
+function continueReplay() {
+  if (replay.switching || mode !== 'replay' || !replay.playing) return;
+  const d = dateInfo();
+  if (!d) return;
+  const next = nextSegment(d, replay.windowEnd);
+  if (next) {
+    replay.switching = true;
+    playReplayAt(Math.max(replay.windowEnd, next.start), { text: '正在接续下一段录像…' });
+  } else {
+    endReplay();
+  }
+}
+
+function endReplay() {
+  freezeReplayFrame();
+  stopReplayStream();
+  stopReplayFeed();
+  replay.loading = false;
+  replay.playing = false;
+  replay.ended = true;
+  replay.time = replay.windowEnd || replay.time;
+  replay.endedNext = nextRunStart(dateInfo(), replay.time);
+  replay.seg = null;
+  updateReplayChrome();
+  updatePositions();
+  refreshStatus();
+  saveMemory();
+  if (replay.endedNext === null) showToast('当天录像已结束，可以切换到其他日期');
+}
+
+function failReplay(text) {
+  stopReplayStream();
+  stopReplayFeed();
+  replay.loading = false;
+  replay.playing = false;
+  replay.ended = false;
+  replay.error = text;
+  showError(text);
+  updateReplayChrome();
+  refreshStatus();
+}
+
+async function playReplayAt(target, options = {}) {
+  if (mode !== 'replay' || !current) return;
+  const d = dateInfo();
+  if (!d) return;
+  const resolved = resolveSeek(d, target);
+  if (!resolved) { showToast('当天没有可播放的录像'); return; }
+  const segment = resolved.segment;
+  const time = resolved.time;
+  const win = windowFor(d, segment, time);
+  stopReplayStream();
+  const token = ++replay.opToken;
+  replay.loading = true;
+  replay.playing = false;
+  replay.ended = false;
+  replay.endedNext = null;
+  replay.error = null;
+  replay.errorAction = 'play';
+  replay.switching = false;
+  replay.time = time;
+  replay.seg = segment;
+  replay.windowEnd = win.end;
+  replay.statusSecond = -1;
+  if (replay.zoom !== 'day') {
+    const range = viewRange();
+    if (time < range.start || time >= range.start + range.span) {
+      replay.anchor = time;
+      renderTimeline();
+    }
+  }
+  showLoading(options.text || `正在定位到 ${fmt(time)}…`);
+  updateReplayChrome();
+  updatePositions();
+  refreshStatus();
+  saveMemory();
+  const controller = new AbortController();
+  replay.requestController = controller;
+  const requestTimer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const r = await api('/api/playback', {
+      method: 'POST', signal: controller.signal,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        did: current.did,
+        channel: '0',
+        start: segment.start,
+        offset: win.offset,
+        duration: win.duration,
+      }),
+    });
+    clearTimeout(requestTimer);
+    if (token !== replay.opToken || mode !== 'replay') return;
+    const player = document.createElement('video-rtc');
+    replay.player = player;
+    player.mode = 'webrtc,mse';
+    player.pcConfig = { bundlePolicy: 'max-bundle', iceServers: [], sdpSemantics: 'unified-plan' };
+    player.visibilityCheck = false;
+    player.background = true;
+    stage.prepend(player);
+    player.video.controls = false;
+    player.video.playsInline = true;
+    player.video.muted = replay.muted;
+    const up = () => {
+      if (token !== replay.opToken || mode !== 'replay') return;
+      clearTimeout(replay.loadTimer);
+      clearFreezeFrame();
+      hideLoading();
+      hideError();
+      if (!replay.playing) {
+        replay.playing = true;
+        replay.loading = false;
+        replay.playFrom = time;
+        replay.wallStart = performance.now();
+        replay.windowEnd = win.end;
+      }
+      updateReplayChrome();
+      updatePositions();
+      refreshStatus();
+    };
+    player.video.addEventListener('playing', up);
+    player.video.addEventListener('error', () => {
+      if (token !== replay.opToken || mode !== 'replay') return;
+      if (player.wsState === WebSocket.CLOSED && player.pcState === WebSocket.CLOSED) return;
+      failReplay('回放画面播放失败，请重试');
+    });
+    replay.loadTimer = setTimeout(() => {
+      if (token !== replay.opToken || replay.playing) return;
+      failReplay('25 秒内没有收到回放画面，请重试');
+    }, 25000);
+    player.src = r.ws;
+  } catch (e) {
+    clearTimeout(requestTimer);
+    if (token !== replay.opToken || mode !== 'replay') return;
+    const message = e.name === 'AbortError' ? '请求回放超时，请重试' : e.message;
+    if (/过期/.test(message)) {
+      replayListAt = 0;
+      replay.errorAction = 'load';
+    }
+    failReplay(message);
+  }
+}
+
+function pauseReplay() {
+  if (mode !== 'replay' || replay.loading || replay.dragging) return;
+  freezeReplayFrame();
+  stopReplayStream();
+  stopReplayFeed();
+  replay.playing = false;
+  replay.time = replay.windowEnd
+    ? clamp(replay.time, replay.playFrom, replay.windowEnd)
+    : replay.time;
+  updateReplayChrome();
+  updatePositions();
+  refreshStatus();
+  saveMemory();
+}
+
+function togglePlay() {
+  if (mode !== 'replay' || replay.loading || replay.dragging) return;
+  if (replay.playing) { pauseReplay(); return; }
+  if (replay.ended) {
+    if (replay.endedNext !== null) {
+      playReplayAt(replay.endedNext, { text: `正在定位到 ${fmt(replay.endedNext)}…` });
+    } else {
+      showToast('当天录像已结束，可以切换到其他日期');
+    }
+    return;
+  }
+  if (replay.error) {
+    playReplayAt(replay.time, { text: '正在重试…' });
+    return;
+  }
+  playReplayAt(replay.time, { text: '正在恢复播放…' });
+}
+
+function skip(delta) {
+  if (mode !== 'replay' || replay.loading || replay.dragging) return;
+  const d = dateInfo();
+  if (!d) return;
+  let t = replay.time + delta;
+  if (!segmentAt(d, t)) {
+    if (delta > 0) {
+      const next = d.segments.find((segment) => segment.start >= t);
+      t = next ? next.start : resolveSeek(d, t)?.time;
+    } else {
+      let prev = null;
+      for (const segment of d.segments) {
+        if (segmentEnd(segment) <= t) prev = segment;
+        else break;
+      }
+      t = prev ? segmentEnd(prev) - 0.5 : resolveSeek(d, t)?.time;
+    }
+  }
+  if (t == null) return;
+  playReplayAt(t, { text: `正在定位到 ${fmt(t)}…` });
+}
+
+function exitReplayMode() {
+  if (mode !== 'replay') return;
+  saveMemory();
+  mode = 'live';
+  replay.opToken++;
+  stopReplayStream();
+  stopReplayFeed();
+  replay.loading = false;
+  replay.playing = false;
+  replay.dragging = false;
+  replay.ended = false;
+  replay.error = null;
+  replay.windowEnd = 0;
+  clearFreezeFrame();
+  hideLoading();
+  hideError();
+  $('pauseLayer').hidden = true;
+  $('scrubLayer').hidden = true;
+  $('track').classList.remove('invalid');
+  stage.classList.remove('scrubbing', 'is-paused');
+  setModeChrome();
+  if (liveSuspended) {
+    liveSuspended = false;
+    players.forEach(connectLens);
+  }
+}
+
+function suspendLive() {
+  for (const entry of players) {
+    stopLens(entry);
+    entry.state = 'idle';
+    entry.status.textContent = '已暂停';
+    entry.status.className = 'pill';
+    entry.overlay.hidden = false;
+    entry.overlay.querySelector('.spinner').hidden = true;
+    entry.overlay.querySelector('p').textContent = '回放中，返回实时后重新连接';
+    entry.retry.disabled = false;
+  }
+  liveSuspended = true;
+}
+
+async function fetchRecordings() {
+  return api('/api/recordings', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ did: current.did }),
+  });
+}
+
+async function ensureReplayData() {
+  if (replayDates.length && Date.now() - replayListAt < 2 * 60 * 1000) return;
+  const entry = players.find((item) => String(item.channel) === '0');
+  if (!entry) throw new Error('没有可用的镜头');
+  if (!mainIsLive()) {
+    if (entry.state !== 'connecting') connectLens(entry);
+    await waitLensPlaying(entry, 45000);
+  }
+  let r;
+  try {
+    r = await fetchRecordings();
+  } catch (e) {
+    if (!/先连接实时|超时/.test(e.message || '')) throw e;
+    connectLens(entry);
+    await waitLensPlaying(entry, 60000);
+    r = await fetchRecordings();
+  }
+  if (mode !== 'replay' || !current) return;
+  if (!Array.isArray(r.recordings)) throw new Error('服务没有返回有效的录像列表');
+  const dates = buildReplayDates(r.recordings);
+  if (!dates.length) throw new Error('存储卡里没有读到可播放的录像');
+  replayDates = dates;
+  replayListAt = Date.now();
+}
+
+async function startReplaySession() {
+  if (mode !== 'replay' || !current) return;
+  const camera = current;
+  const generation = viewGeneration;
+  hideError();
+  replay.error = null;
+  replay.errorAction = 'load';
+  replay.loading = true;
+  replay.playing = false;
+  replay.ended = false;
+  showLoading('正在读取存储卡录像…');
+  updateReplayChrome();
+  refreshStatus();
+  try {
+    await ensureReplayData();
+    if (mode !== 'replay' || current !== camera || generation !== viewGeneration) return;
+    suspendLive();
+    const memory = replayMemory.get(camera.did);
+    let index = 0;
+    if (memory) {
+      const i = replayDates.findIndex((d) => d.key === memory.dateKey);
+      if (i >= 0) index = i;
+    }
+    replay.dateIndex = index;
+    const d = replayDates[index];
+    let target = null;
+    if (memory && memory.dateKey === d.key) target = resolveSeek(d, memory.time)?.time ?? null;
+    if (target == null) target = defaultPosition(d);
+    replay.time = target;
+    replay.anchor = target;
+    renderDatePills();
+    renderTimeline();
+    await playReplayAt(target);
+  } catch (e) {
+    if (mode !== 'replay' || current !== camera) return;
+    replay.errorAction = 'load';
+    failReplay(e.message);
+  }
+}
+
+async function enterReplayMode() {
+  if (!current || mode === 'replay') return;
+  if (!replaySupported()) {
+    modal('暂不支持回放', '这台机型的存储卡回放尚未接通。');
+    return;
+  }
+  mode = 'replay';
+  replay.zoom = '1h';
+  document.querySelectorAll('[data-zoom]').forEach((b) => b.classList.toggle('active', b.dataset.zoom === '1h'));
+  replay.playing = false;
+  replay.loading = false;
+  replay.dragging = false;
+  replay.ended = false;
+  replay.error = null;
+  replay.windowEnd = 0;
+  hideError();
+  hideLoading();
+  $('pauseLayer').hidden = true;
+  $('scrubLayer').hidden = true;
+  $('tlSub').textContent = '正在读取录像列表…';
+  setModeChrome();
+  await startReplaySession();
+}
+
+async function selectReplayDate(index) {
+  if (mode !== 'replay') return;
+  const d = replayDates[index];
+  if (!d || index === replay.dateIndex) return;
+  replay.dateIndex = index;
+  markDatePills();
+  const now = Math.floor(Date.now() / 1000);
+  let target = null;
+  if (index === 0) {
+    target = defaultPosition(d);
+  } else if (replay.time) {
+    const tod = replay.time - dayStartOfKey(dateKeyOf(replay.time));
+    target = resolveSeek(d, d.dayStart + tod)?.time ?? null;
+  }
+  if (target == null) target = defaultPosition(d);
+  replay.time = target;
+  replay.anchor = target;
+  renderTimeline();
+  await playReplayAt(target, { text: `正在读取 ${d.key} 的录像…` });
+}
+
+function pointerTime(event) {
+  const d = dateInfo();
+  if (!d) return 0;
+  const rect = track.getBoundingClientRect();
+  const ratio = clamp((event.clientX - rect.left) / rect.width, 0, 0.99999);
+  const range = viewRange();
+  return clamp(Math.round(range.start + ratio * range.span), d.dayStart, d.dayStart + DAY - 1);
+}
+
+function updateDrag(event) {
+  const d = dateInfo();
+  if (!d) return;
+  const t = pointerTime(event);
+  const valid = recordedAt(d, t);
+  replay.time = t;
+  placePlayhead();
+  $('timeNow').textContent = fmt(t);
+  $('scrubLayer').textContent = valid ? `松手定位到 ${fmt(t)}` : `${fmt(t)} · 无录像`;
+  $('scrubLayer').classList.toggle('bad', !valid);
+  track.classList.toggle('invalid', !valid);
+  $('statusText').textContent = valid ? `拖动定位 · ${fmt(t)}` : `拖动定位 · ${fmt(t)}（无录像）`;
+  $('remainChip').hidden = true;
+  $('nextRunBtn').hidden = true;
+  $('statusDot').classList.add('idle');
+}
+
+function restoreAfterDrag() {
+  replay.playing = replay.dragWasPlaying;
+  if (replay.playing) {
+    replay.time = clamp(
+      replay.playFrom + (performance.now() - replay.wallStart) / 1000,
+      replay.playFrom,
+      replay.windowEnd,
+    );
+  } else {
+    replay.time = replay.dragOrigin;
+  }
+  updateReplayChrome();
+  updatePositions();
+  refreshStatus();
+}
+
+function finishDrag(canceled) {
+  if (!replay.dragging) return;
+  replay.dragging = false;
+  stage.classList.remove('scrubbing');
+  $('scrubLayer').hidden = true;
+  track.classList.remove('invalid');
+  const d = dateInfo();
+  if (!canceled && d && recordedAt(d, replay.time)) {
+    playReplayAt(replay.time);
+    return;
+  }
+  if (!canceled) showToast('这个时段没有录像，已退回原来的位置');
+  restoreAfterDrag();
+}
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  else stageCard.requestFullscreen?.().catch(() => {});
+}
+
+// ---------- 事件绑定 ----------
+
+$('modeLiveBtn').onclick = () => { if (mode === 'replay') exitReplayMode(); };
+$('modeReplayBtn').onclick = () => { enterReplayMode(); };
+$('playBtn').onclick = togglePlay;
+$('bigPlay').onclick = (e) => { e.stopPropagation(); togglePlay(); };
+$('backBtn').onclick = () => skip(-30);
+$('fwdBtn').onclick = () => skip(30);
+$('liveBtn').onclick = exitReplayMode;
+$('fsBtn').onclick = toggleFullscreen;
+$('muteBtn').onclick = () => {
+  replay.muted = !replay.muted;
+  if (replay.player) replay.player.video.muted = replay.muted;
+  updateReplayChrome();
+};
+$('nextRunBtn').onclick = () => {
+  if (replay.endedNext === null) return;
+  playReplayAt(replay.endedNext, { text: `正在定位到 ${fmt(replay.endedNext)}…` });
+};
+$('errorRetry').onclick = () => {
+  if (mode !== 'replay') return;
+  if (replay.errorAction === 'load') startReplaySession();
+  else playReplayAt(replay.time, { text: '正在重试…' });
+};
+$('errorLive').onclick = exitReplayMode;
+
+document.querySelectorAll('[data-zoom]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (mode !== 'replay' || btn.dataset.zoom === replay.zoom) return;
+    replay.zoom = btn.dataset.zoom;
+    replay.anchor = replay.time;
+    document.querySelectorAll('[data-zoom]').forEach((b) => b.classList.toggle('active', b === btn));
+    renderTimeline();
+    updatePositions();
+  });
 });
+
+stage.addEventListener('click', (e) => {
+  if (mode !== 'replay' || replay.loading || replay.dragging || replay.error) return;
+  if (e.target.closest('.controls, .cam-hud, .error-layer, .loading-layer')) return;
+  togglePlay();
+});
+
+$('ovTrack').addEventListener('pointerdown', (e) => {
+  if (mode !== 'replay' || replay.loading) return;
+  const d = dateInfo();
+  if (!d) return;
+  const rect = $('ovTrack').getBoundingClientRect();
+  const ratio = clamp((e.clientX - rect.left) / rect.width, 0, 0.99999);
+  const raw = d.dayStart + ratio * DAY;
+  const near = resolveSeek(d, raw);
+  if (!near) return;
+  if (!recordedAt(d, Math.floor(raw))) showToast(`已跳到最近的录像 ${fmt(near.time)}`);
+  playReplayAt(near.time);
+});
+
+track.addEventListener('pointerdown', (e) => {
+  if (mode !== 'replay' || replay.loading) return;
+  e.preventDefault();
+  track.setPointerCapture?.(e.pointerId);
+  replay.dragging = true;
+  replay.dragWasPlaying = replay.playing;
+  replay.dragOrigin = replay.time;
+  replay.playing = false;
+  replay.ended = false;
+  replay.endedNext = null;
+  replay.error = null;
+  stage.classList.add('scrubbing');
+  $('scrubLayer').hidden = false;
+  $('pauseLayer').hidden = true;
+  updateDrag(e);
+});
+track.addEventListener('pointermove', (e) => {
+  if (!replay.dragging) return;
+  updateDrag(e);
+});
+track.addEventListener('pointerup', () => finishDrag(false));
+track.addEventListener('pointercancel', () => finishDrag(true));
+
+document.addEventListener('keydown', (e) => {
+  if (playerView.hidden) return;
+  const tag = e.target?.tagName || '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) return;
+  if (e.code === 'Space') {
+    if (mode !== 'replay') return;
+    e.preventDefault();
+    togglePlay();
+  } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    if (mode === 'replay') {
+      if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        skip(e.key === 'ArrowLeft' ? -30 : 30);
+      }
+      return;
+    }
+    // 按住方向键会一连串发云台指令，一步一按更好控制
+    if (e.repeat || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (!$('modal').hidden || !canMoveMotor()) return;
+    e.preventDefault();
+    moveMotor({ ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' }[e.key]);
+  } else if (e.key === 'Escape' && !document.fullscreenElement) {
+    if (mode === 'replay') exitReplayMode();
+    else closePlayer();
+  }
+});
+
+window.addEventListener('pagehide', () => {
+  if (mode === 'replay') stopReplayFeed();
+});
+
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (mode === 'replay') {
+      const d = dateInfo();
+      if (d) renderGaps(viewRange(), d);
+    }
+  }, 150);
+});
+
+function loop() {
+  if (mode === 'replay') replayTick();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
 
 loadState();

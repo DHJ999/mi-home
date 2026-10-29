@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>米家看家</title>
+<link rel="icon" href="data:," />
 <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
@@ -76,19 +77,129 @@
       </div>
       <div class="player-actions">
         <span class="pill" id="streamState">准备中</span>
+        <div class="segmented" id="modeSwitch" role="group" aria-label="画面模式">
+          <button type="button" id="modeLiveBtn" class="active">实时</button>
+          <button type="button" id="modeReplayBtn">回放</button>
+        </div>
         <button class="ghost" id="reloadBtn">重新连接</button>
         <button class="ghost" id="closePlayer">关闭</button>
       </div>
     </div>
-    <div class="video-shell" id="videoShell">
-      <div class="video-overlay" id="videoOverlay">
-        <div class="spinner"></div>
-        <p id="overlayText">正在通过小米云端连接摄像头…</p>
-      </div>
+
+    <div id="liveView">
+      <div class="video-grid" id="videoGrid"></div>
+      <section class="card motor-panel" id="motorPanel" aria-labelledby="motorTitle" hidden>
+        <div>
+          <h3 id="motorTitle">云台控制</h3>
+          <p class="hint">控制镜头 1，镜头 2 保持固定。点击按钮或按键盘 ↑ ↓ ← → 转动，发送后请等待画面变化，避免连续操作。</p>
+          <p class="hint" id="motorStatus" role="status" aria-live="polite">连接镜头 1 后可发送转动指令。</p>
+        </div>
+        <div class="direction-pad" role="group" aria-label="云台方向">
+          <button type="button" class="ghost" data-direction="up" aria-label="向上转动" disabled>上</button>
+          <button type="button" class="ghost" data-direction="left" aria-label="向左转动" disabled>左</button>
+          <span aria-hidden="true">云台</span>
+          <button type="button" class="ghost" data-direction="right" aria-label="向右转动" disabled>右</button>
+          <button type="button" class="ghost" data-direction="down" aria-label="向下转动" disabled>下</button>
+        </div>
+      </section>
+      <p class="hint">画面由本机转码后播放；双镜头分别连接、分别重试，通常有几秒延迟。默认静音，使用各画面的音量按钮开启声音。</p>
     </div>
-    <p class="hint">画面走小米云端的加密通道，由本机转码后播放，通常有几秒延迟；点画面可取消静音。</p>
+
+    <div id="replayView" hidden>
+      <section class="stage-card" id="stageCard">
+        <div class="stage" id="stage">
+          <div class="stage-shade"></div>
+          <div class="cam-hud">
+            <div class="hud-row">
+              <span class="mode-badge" id="modeBadge"><span class="dot"></span><span id="modeText">回放</span></span>
+              <span class="lens-chip" id="lensChip">镜头 1</span>
+            </div>
+            <div class="osd" id="osd">--:--:--</div>
+          </div>
+
+          <div class="loading-layer" id="loadingLayer">
+            <span class="spinner"></span>
+            <span id="loadingText">正在读取存储卡录像…</span>
+          </div>
+          <div class="error-layer" id="errorLayer" hidden>
+            <p id="errorText"></p>
+            <div class="error-actions">
+              <button class="ghost" type="button" id="errorRetry">重试</button>
+              <button class="ghost" type="button" id="errorLive">返回实时</button>
+            </div>
+          </div>
+          <div class="pause-layer" id="pauseLayer" hidden>
+            <button class="big-play" id="bigPlay" type="button" aria-label="继续播放">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></svg>
+            </button>
+            <span id="pauseText">已暂停</span>
+          </div>
+          <div class="scrub-layer" id="scrubLayer" hidden></div>
+
+          <div class="controls" id="playbackControls">
+            <button class="ctrl icon" id="playBtn" type="button" aria-label="暂停"></button>
+            <button class="ctrl text" id="backBtn" type="button" aria-label="后退 30 秒">-30s</button>
+            <button class="ctrl text" id="fwdBtn" type="button" aria-label="前进 30 秒">+30s</button>
+            <div class="timecode"><span id="timeNow">--:--:--</span><span class="sep">/</span><span class="end" id="timeEnd">--:--:--</span></div>
+            <div class="ctrl-spacer"></div>
+            <button class="ctrl icon" id="muteBtn" type="button" aria-label="开启声音"></button>
+            <button class="ctrl text live-return" id="liveBtn" type="button">返回实时</button>
+            <button class="ctrl icon" id="fsBtn" type="button" aria-label="全屏"></button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card replay-card" id="replayCard">
+        <div class="tl-head">
+          <div>
+            <h3>存储卡回放</h3>
+            <div class="tl-sub" id="tlSub">正在读取录像列表…</div>
+          </div>
+          <div class="zoom" role="group" aria-label="时间轴缩放">
+            <button type="button" data-zoom="1h" class="active">1 小时</button>
+            <button type="button" data-zoom="6h">6 小时</button>
+            <button type="button" data-zoom="day">全天</button>
+          </div>
+        </div>
+
+        <div class="date-row" id="dateRow" aria-label="录像日期"></div>
+
+        <div class="overview">
+          <div class="ov-track" id="ovTrack" title="全天录像分布，点击跳转">
+            <div class="ov-runs" id="ovRuns"></div>
+            <div class="ov-window" id="ovWindow"></div>
+            <div class="ov-head" id="ovHead"></div>
+          </div>
+          <div class="ov-labels"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>24:00</span></div>
+        </div>
+
+        <div class="detail">
+          <div class="ruler" id="ruler"></div>
+          <div class="track-wrap">
+            <div class="track" id="track" role="slider" tabindex="0"
+                 aria-label="录像时间轴" aria-valuemin="0" aria-valuemax="86400" aria-valuenow="0">
+              <div class="runs" id="runs"></div>
+              <div class="seg-ticks" id="segTicks"></div>
+              <div class="gap-labels" id="gapLabels"></div>
+            </div>
+            <div class="playhead" id="playhead"></div>
+          </div>
+        </div>
+
+        <div class="tl-status">
+          <span class="status-dot idle" id="statusDot"></span>
+          <span id="statusText">正在读取录像列表…</span>
+          <span class="remain" id="remainChip" hidden></span>
+          <span class="ctrl-spacer"></span>
+          <button class="mini-btn" id="nextRunBtn" type="button" hidden>继续下一段</button>
+        </div>
+        <p class="hint" id="replayHint">橙色为有录像时段。拖动只预览时间，松手才重新建立播放流（实际约 2–4 秒）；播放到窗口末尾会自动接续下一段。</p>
+      </section>
+    </div>
   </section>
 </main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <div class="modal" id="modal" hidden>
   <div class="modal-box card">

@@ -338,8 +338,10 @@ export class VideoRTC extends HTMLElement {
             this.pc = null;
         }
 
-        this.video.src = '';
+        this.video.pause();
         this.video.srcObject = null;
+        this.video.removeAttribute('src');
+        this.video.load();
     }
 
     /**
@@ -464,20 +466,23 @@ export class VideoRTC extends HTMLElement {
                     }
                 }
 
-                if (!sb.updating && sb.buffered && sb.buffered.length) {
-                    const end = sb.buffered.end(sb.buffered.length - 1);
-                    const start = end - 5;
-                    const start0 = sb.buffered.start(0);
-                    if (start > start0) {
-                        sb.remove(start0, start);
-                        ms.setLiveSeekableRange(start, end);
+                try {
+                    if (!sb.updating && sb.buffered.length) {
+                        const end = sb.buffered.end(sb.buffered.length - 1);
+                        const start = end - 5;
+                        const start0 = sb.buffered.start(0);
+                        if (start > start0) {
+                            sb.remove(start0, start);
+                            ms.setLiveSeekableRange(start, end);
+                        }
+                        if (this.video.currentTime < start) {
+                            this.video.currentTime = start;
+                        }
+                        const gap = end - this.video.currentTime;
+                        this.video.playbackRate = gap > 0.1 ? gap : 0.1;
                     }
-                    if (this.video.currentTime < start) {
-                        this.video.currentTime = start;
-                    }
-                    const gap = end - this.video.currentTime;
-                    this.video.playbackRate = gap > 0.1 ? gap : 0.1;
-                    // console.debug('VideoRTC.buffered', gap, this.video.playbackRate, this.video.readyState);
+                } catch (e) {
+                    // SourceBuffer 在播放器销毁后失效，忽略
                 }
             });
 

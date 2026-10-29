@@ -59,16 +59,6 @@ async function waitReady(ms) {
   return false;
 }
 
-async function tailError() {
-  try {
-    const text = await fs.readFile(LOG, 'utf8');
-    const lines = text.split(/\r?\n/).filter((l) => /cs2 cloud|tutk|ERROR|error/i.test(l));
-    return lines.slice(-3).join(' / ');
-  } catch {
-    return '';
-  }
-}
-
 async function apiUp() {
   try {
     return (await request('/api/streams', {}, 2000)).ok;
@@ -138,38 +128,98 @@ async function putStream(name, src) {
   if (!r.ok) throw new Error('添加摄像头失败（' + r.status + '）：' + r.body.toString().trim());
 }
 
-/**
- * Open one camera through Xiaomi's cloud relay and return the player url.
- * The raw stream keeps the camera's own codec; the "h" copy is transcoded to
- * H.264/Opus so any browser can show it.
- */
-export async function openCamera({ userId, region, did, model, localip }) {
-  const name = 'cam' + did;
-  const raw = `xiaomi://${userId}:${region}@${localip || '127.0.0.1'}?did=${did}&model=${model}`;
-  await putStream(name, raw);
-  await putStream(name + 'h', `ffmpeg:${RTSP}/${name}#video=h264#audio=opus`);
-
-  // Asking for one snapshot starts the producer and proves the P2P session;
-  // the first cloud connect can take a few seconds while the camera wakes up.
-  let ok = false;
-  for (let i = 0; i < 3 && !ok; i++) {
+// 关掉播放器不会释放小米 P2P 会话，旧流会一直占着摄像头，几次拖动后新连接就起不来
+async function deleteStreams(names) {
+  await Promise.all(names.map(async (name) => {
     try {
-      const r = await request('/api/frame.jpeg?src=' + encodeURIComponent(name), {}, 45000);
-      ok = r.ok && r.body.length > 1000;
-      if (!ok) await sleep(1500);
-    } catch {
-      await sleep(1500);
-    }
-  }
-  if (!ok) {
-    const detail = await tailError();
-    throw new Error('没能连上这台摄像头的云端通道' + (detail ? '：' + detail : '，请稍后重试'));
-  }
+      await request('/api/streams?src=' + encodeURIComponent(name), { method: 'DELETE' }, 5000);
+    } catch {}
+  }));
+}
 
+async function streamNames() {
+  try {
+    const r = await request('/api/streams', {}, 5000);
+    if (!r.ok) return [];
+    return Object.keys(JSON.parse(r.body.toString()));
+  } catch {
+    return [];
+  }
+}
+
+async function stopReplayStreams(did) {
+  const prefix = 'cam' + did + 'r';
+  await deleteStreams((await streamNames()).filter((name) => name.startsWith(prefix)));
+}
+
+// 回放和直播共用摄像头会话，直播两路不腾出来，窗口接续时新旧会话叠加会被拒绝
+async function stopLiveStreams(did) {
+  const names = ['cam' + did, 'cam' + did + 'h', 'cam' + did + 'c2', 'cam' + did + 'c2h'];
+  await deleteStreams(names);
+}
+
+export async function stopPlayback(did) {
+  await stopReplayStreams(did);
+}
+
+export async function openCamera({ userId, region, did, model, localip, channel = '0', replay }) {
+  if (!['0', '2'].includes(channel) || (channel === '2' && model !== 'isa.camera.hlmax')) {
+    throw new Error('这台摄像头没有所选镜头');
+  }
+  await stopReplayStreams(did);
+  if (replay) await stopLiveStreams(did);
+  const name = 'cam' + did + (channel === '0' ? '' : 'c2') + (replay ? `r${replay.start}o${replay.offset}` : '');
+  const query = new URLSearchParams({ did, model, channel });
+  // CW500 的默认档只有 640×360，2.5K 必须显式要 3 档
+  if (!replay && model === 'isa.camera.hlmax') query.set('subtype', '3');
+  if (replay) {
+    query.set('replay', String(replay.start));
+    query.set('offset', String(replay.offset));
+    query.set('duration', String(replay.duration));
+  }
+  const raw = `xiaomi://${userId}:${region}@${localip || '127.0.0.1'}?${query}`;
+  await putStream(name, raw);
+  await putStream(name + 'h', `ffmpeg:${RTSP}/${name}#video=h264#audio=opus#timeout=30`);
+
+  // Let the player open the session: a separate snapshot would reconnect both lenses twice.
   return {
     name,
     ws: `${API}/api/ws?src=${encodeURIComponent(name + 'h')}`,
   };
+}
+
+export async function moveCamera(did, direction) {
+  if (!['up', 'down', 'left', 'right'].includes(direction)) {
+    throw new Error('无效的云台方向');
+  }
+  const query = new URLSearchParams({ src: 'cam' + did, motor: direction, via: 'p2p' });
+  let r;
+  try {
+    r = await request('/api/xiaomi/ctl?' + query, { method: 'POST' }, 15000);
+  } catch {
+    throw new Error('云台请求超时，结果尚未确认，请先观察画面，避免连续点击');
+  }
+  if (r.status === 409) throw new Error('云台连接已断开，请先重连镜头 1');
+  if (!r.ok || r.body.toString().trim() !== 'ok') {
+    throw new Error('云台指令未能发送，请确认镜头 1 已连接后重试');
+  }
+}
+
+export async function listRecordings(did) {
+  const query = new URLSearchParams({ src: 'cam' + did });
+  let r;
+  try {
+    r = await request('/api/xiaomi/recordings?' + query, {}, 35000);
+  } catch {
+    throw new Error('读取存储卡录像超时，请重连实时画面后重试');
+  }
+  if (r.status === 409) throw new Error('请先连接实时画面（双摄设备请连接镜头 1）');
+  if (!r.ok) throw new Error('读取存储卡失败，请重连画面后重试：' + r.body.toString().trim());
+  const items = JSON.parse(r.body.toString());
+  if (!Array.isArray(items) || items.some((item) => !Number.isSafeInteger(item.start) || item.start <= 0 || !Number.isInteger(item.duration) || item.duration <= 0 || item.duration > 255)) {
+    throw new Error('摄像头返回的录像列表格式不正确');
+  }
+  return items;
 }
 
 export async function stop() {

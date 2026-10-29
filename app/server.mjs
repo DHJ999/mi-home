@@ -6,7 +6,7 @@ import { exec } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { MiIOT, getMiIOT } from 'mi-service-lite';
 import { beginBrowserLogin, browserLoginState, browserLoginHookToken, ingestHookPayload } from './browser-login.mjs';
-import { ensureRunning, openCamera, stop as stopGo2rtc } from './go2rtc.mjs';
+import { ensureRunning, openCamera, moveCamera, listRecordings, stopPlayback, stop as stopGo2rtc } from './go2rtc.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 process.chdir(ROOT);
@@ -20,6 +20,7 @@ const REGION = process.env.MI_REGION || 'cn';
 let account = null;
 let miot = null;
 let cameras = [];
+const recordingLists = new Map();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -83,6 +84,10 @@ function applyDevices(list) {
       model: d.model,
       online: !!d.isOnline,
       localip: d.localip,
+      lenses: d.model === 'isa.camera.hlmax'
+        ? [{ channel: '0', label: '镜头 1' }, { channel: '2', label: '镜头 2' }]
+        : [{ channel: '0', label: '摄像头画面' }],
+      ptz: d.model === 'isa.camera.hlmax',
     }));
   return cameras;
 }
@@ -185,10 +190,7 @@ async function runVerifyAttempt() {
 }
 
 // 画面走小米云端的 cs2 P2P 通道，由本地 go2rtc 负责打洞和转码
-async function startStream(did) {
-  if (!cameras.length) await listCameras();
-  const cam = cameras.find((c) => c.did === did);
-  if (!cam) throw new Error('设备不在列表里，请刷新');
+async function startStream(cam, channel, replay) {
   const passToken = account?.pass?.passToken;
   if (!passToken) throw new Error('登录信息里没有云端凭证，请退出后重新登录');
   await ensureRunning(String(account.userId), passToken);
@@ -198,8 +200,12 @@ async function startStream(did) {
     did: cam.did,
     model: cam.model,
     localip: cam.localip,
+    channel,
+    replay,
   });
 }
+
+const movingCameras = new Set();
 
 async function serveStatic(res, pathname) {
   const file = path.join(PUB, pathname === '/' ? 'index.html' : pathname.slice(1));
@@ -275,17 +281,87 @@ const server = http.createServer(async (req, res) => {
       if (!account) return json(res, 401, { error: '未登录' });
       return json(res, 200, { cameras: await listCameras() });
     }
-    if (req.method === 'POST' && url.pathname === '/api/stream') {
+    if (req.method === 'POST' && ['/api/stream', '/api/motor', '/api/recordings', '/api/playback', '/api/playback/stop'].includes(url.pathname)) {
       if (!account) return json(res, 401, { error: '未登录' });
-      const { did } = await readBody(req);
-      const r = await startStream(did);
-      return json(res, 200, r);
+      if (req.headers.origin && req.headers.origin !== `http://127.0.0.1:${PORT}`) {
+        return json(res, 403, { error: '不允许其他网站控制摄像头' });
+      }
+      if (req.headers['content-type']?.split(';')[0].trim() !== 'application/json') {
+        return json(res, 415, { error: '请使用 JSON 请求' });
+      }
+      let body;
+      try { body = await readBody(req); } catch { return json(res, 400, { error: '请求格式错误' }); }
+      if (!body || typeof body.did !== 'string') return json(res, 400, { error: '设备参数错误' });
+      if (!cameras.length) await listCameras();
+      const cam = cameras.find((c) => c.did === body.did);
+      if (!cam) return json(res, 404, { error: '设备不在列表里，请刷新' });
+      if (!cam.online) return json(res, 409, { error: '摄像头离线，请先在米家 App 中检查' });
+      if (url.pathname === '/api/playback/stop') {
+        await stopPlayback(cam.did);
+        return json(res, 200, { ok: true });
+      }
+      if (url.pathname === '/api/recordings') {
+        if (!['isa.camera.hlmax', 'isa.camera.hlc7'].includes(cam.model)) {
+          return json(res, 400, { error: '尚未接入这台机型的存储卡协议' });
+        }
+        const cached = recordingLists.get(cam.did);
+        if (cached && Date.now() - cached.at < 2 * 60 * 1000) {
+          return json(res, 200, { recordings: cached.items });
+        }
+        const recordings = await listRecordings(cam.did);
+        recordingLists.set(cam.did, { items: recordings, at: Date.now() });
+        return json(res, 200, { recordings });
+      }
+      if (url.pathname === '/api/playback') {
+        const channel = body.channel ?? '0';
+        if (!cam.lenses.some((lens) => lens.channel === channel)) {
+          return json(res, 400, { error: '这台摄像头没有所选镜头' });
+        }
+        if (channel !== '0') {
+          return json(res, 400, { error: '镜头 2 的存储卡回放尚未接通，请选择镜头 1' });
+        }
+        const list = recordingLists.get(cam.did);
+        if (!list || Date.now() - list.at > 12 * 60 * 60 * 1000) {
+          return json(res, 409, { error: '录像列表已过期，请返回实时后重新进入回放' });
+        }
+        const segment = list.items.find((item) => item.start === body.start);
+        const offset = body.offset ?? 0;
+        const duration = body.duration ?? segment?.duration ?? 0;
+        if (!segment || !Number.isInteger(offset) || offset < 0 || offset >= segment.duration) {
+          return json(res, 400, { error: '请选择列表中的录像和有效播放位置' });
+        }
+        // 摄像头本身连续播放，duration 只控制本次连接在客户端的截止时刻
+        if (!Number.isInteger(duration) || duration <= offset || duration > 255) {
+          return json(res, 400, { error: '播放窗口无效' });
+        }
+        return json(res, 200, await startStream(cam, channel, { start: segment.start, duration, offset }));
+      }
+      if (url.pathname === '/api/stream') {
+        const channel = body.channel ?? '0';
+        if (!cam.lenses.some((lens) => lens.channel === channel)) {
+          return json(res, 400, { error: '这台摄像头没有所选镜头' });
+        }
+        return json(res, 200, await startStream(cam, channel));
+      }
+      if (!cam.ptz) return json(res, 400, { error: '尚未接入这台摄像头的云台控制' });
+      if (!['up', 'down', 'left', 'right'].includes(body.direction)) {
+        return json(res, 400, { error: '无效的云台方向' });
+      }
+      if (movingCameras.has(cam.did)) return json(res, 409, { error: '上一条云台指令尚未完成' });
+      movingCameras.add(cam.did);
+      try {
+        await moveCamera(cam.did, body.direction);
+        return json(res, 200, { ok: true });
+      } finally {
+        movingCameras.delete(cam.did);
+      }
     }
     if (req.method === 'POST' && url.pathname === '/api/logout') {
       cancelVerify();
       account = null;
       miot = null;
       cameras = [];
+      recordingLists.clear();
       await stopGo2rtc();
       await fs.rm(SESSION, { force: true });
       return json(res, 200, { ok: true });
