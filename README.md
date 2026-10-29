@@ -22,7 +22,7 @@ npm install
 |---|---|
 | Node.js 18+ | 后端与网页服务 |
 | ffmpeg | 默认取 `D:\ffmpeg\bin\ffmpeg.exe`，改路径在 `app/go2rtc.mjs` 顶部 |
-| `go2rtc/go2rtc-cs2.exe` | **不入库**，见下 |
+| `go2rtc/go2rtc-cs2.exe` | 不进仓库，从 [Releases](../../releases/latest) 下载，见下 |
 
 ## 目录
 
@@ -50,9 +50,17 @@ go2rtc/     流媒体服务的可执行文件与运行时产物（配置/日志�
 - 退出登录会删除 `session.json` 并停掉本机流媒体服务
 - 不要把这两个文件发给任何人，拿到等于拿到你的小米账号
 
-## 为什么仓库 clone 下来跑不了
+## 运行包：go2rtc-cs2.exe
 
-米家摄像头的云端拉流协议（中继地址解码、握手报文）是我逆向出来的，成果编在 `go2rtc-cs2.exe` 里，属于逆向资料，**不随仓库发布**，所以这个仓库只有应用层代码。协议细节、支持的机型和踩坑记录都留在本地笔记里，不在这里公开。
+摄像头取流靠一个 20MB 的可执行文件，它基于开源的 [go2rtc](https://github.com/AlexxIT/go2rtc) 改造，**放不进仓库，改放在 Releases 里**：
+
+1. 到 [Releases](../../releases/latest) 下载 `go2rtc-cs2.exe`
+2. 放进仓库根的 `go2rtc/` 目录（和 `go2rtc.mjs` 里写的路径一致）
+3. 之后照「快速开始」启动即可
+
+它只负责“打洞取流 + 转码”，不含任何账号信息；你的登录凭证是运行时写到本机的 `go2rtc/go2rtc-app.yaml`，不会随程序外传。
+
+这个二进制包含了 MIT 许可的 go2rtc 代码，许可全文见 [LICENSE-go2rtc.txt](LICENSE-go2rtc.txt)。
 
 ## 已知边界
 
