@@ -8,8 +8,6 @@
 [![平台][b-platform]][repo]
 [![Node][b-node]][repo]
 [![运行包][b-release]][releases]
-[![下载][b-download]][releases]
-[![Stars][b-stars]][repo]
 [![最近提交][b-commit]][commits]
 [![许可][b-license]](#许可与免责)
 
@@ -168,7 +166,5 @@ go2rtc/     运行包与运行时产物：go2rtc-cs2.exe、配置、日志
 [b-platform]: https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Windows%2010%20%2F%2011-0078D6?logo=windows&logoColor=white
 [b-node]: https://img.shields.io/badge/Node.js-18%2B-339933?logo=node.js&logoColor=white
 [b-release]: https://img.shields.io/github/v/release/DHJ999/mi-home?label=%E8%BF%90%E8%A1%8C%E5%8C%85
-[b-download]: https://img.shields.io/github/downloads/DHJ999/mi-home/total?label=%E4%B8%8B%E8%BD%BD
-[b-stars]: https://img.shields.io/github/stars/DHJ999/mi-home?label=star
 [b-commit]: https://img.shields.io/github/last-commit/DHJ999/mi-home?label=%E6%9C%80%E8%BF%91%E6%8F%90%E4%BA%A4
 [b-license]: https://img.shields.io/badge/%E8%AE%B8%E5%8F%AF-%E4%BB%85%E4%BE%9B%E4%B8%AA%E4%BA%BA%E4%BD%BF%E7%94%A8-6e7781
