@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>米家看家</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="dot"></span>
+    <h1>米家看家</h1>
+    <span class="tag" id="envTag">本地运行 · 127.0.0.1</span>
+  </div>
+  <div class="top-right">
+    <span class="user" id="userLine" hidden></span>
+    <button class="ghost" id="logoutBtn" hidden>退出登录</button>
+  </div>
+</header>
+
+<main>
+  <section id="loginView" class="login-wrap" hidden>
+    <div class="card login-card">
+      <h2>登录小米账号</h2>
+      <p class="sub">点下面的按钮会弹出一个<b>真正的小米官方登录窗口</b>：账号密码、短信验证码、异地登录验证全部在小米自己的页面完成，本程序只接收“登录成功”的结果。</p>
+      <button class="primary" type="button" id="browserLoginBtn">打开小米官方登录窗口</button>
+      <div id="browserLoginMsg" class="msg" hidden></div>
+      <div class="divider"><span>或</span></div>
+      <button class="ghost" type="button" id="showPassForm">用账号密码直接登录（不推荐，可能反复触发验证）</button>
+      <form id="loginForm" autocomplete="on" hidden>
+        <label>
+          <span>小米账号</span>
+          <input id="user" name="username" type="text" placeholder="手机号 / 邮箱 / 小米 ID" autocomplete="username" required />
+        </label>
+        <label>
+          <span>密码</span>
+          <div class="pass-row">
+            <input id="pass" name="password" type="password" placeholder="小米账号密码" autocomplete="current-password" required />
+            <button type="button" class="ghost small" id="togglePass">显示</button>
+          </div>
+        </label>
+        <button class="primary" type="submit" id="loginBtn">登录</button>
+      </form>
+      <div id="loginMsg" class="msg" hidden></div>
+      <div id="verifyBox" class="verify" hidden>
+        <p>小米检测到异地登录，需要你先在浏览器里完成一次安全验证：</p>
+        <a id="verifyLink" class="primary link" href="#" target="_blank" rel="noreferrer">打开小米验证页面</a>
+        <p class="todo" id="verifyStatus" hidden></p>
+        <p class="todo">完成后不用手动刷新，程序会自动检查授权状态并进入设备列表；小米同步有时要几分钟到 1 小时。</p>
+      </div>
+      <p class="foot">登录态只保存在本机 <code>app/session.json</code>，不会上传。需要撤销时点右上角「退出登录」。</p>
+    </div>
+  </section>
+
+  <section id="homeView" hidden>
+    <div class="bar">
+      <div class="bar-left">
+        <h2>我的摄像头</h2>
+        <span class="muted" id="camCount"></span>
+      </div>
+      <button class="ghost" id="refreshBtn">刷新设备</button>
+    </div>
+    <div id="cameraGrid" class="grid"></div>
+    <div id="emptyBox" class="empty" hidden>
+      <p>这个账号下没有找到摄像头设备。</p>
+      <p class="muted">如果米家里明明有，点「刷新设备」再试；门铃类设备也会显示在这里。</p>
+    </div>
+  </section>
+
+  <section id="playerView" class="player-view" hidden>
+    <div class="player-head">
+      <div>
+        <h2 id="playerTitle">摄像头</h2>
+        <span class="muted" id="playerMeta"></span>
+      </div>
+      <div class="player-actions">
+        <span class="pill" id="streamState">准备中</span>
+        <button class="ghost" id="reloadBtn">重新连接</button>
+        <button class="ghost" id="closePlayer">关闭</button>
+      </div>
+    </div>
+    <div class="video-shell" id="videoShell">
+      <div class="video-overlay" id="videoOverlay">
+        <div class="spinner"></div>
+        <p id="overlayText">正在通过小米云端连接摄像头…</p>
+      </div>
+    </div>
+    <p class="hint">画面走小米云端的加密通道，由本机转码后播放，通常有几秒延迟；点画面可取消静音。</p>
+  </section>
+</main>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-box card">
+    <h3 id="modalTitle">提示</h3>
+    <p id="modalText"></p>
+    <div class="modal-actions"><button class="primary" id="modalOk">知道了</button></div>
+  </div>
+</div>
+
+<script type="module" src="/app.js"></script>
+</body>
+</html>

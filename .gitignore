@@ -1,0 +1,25 @@
+# 依赖
+node_modules/
+
+# 小米登录态与凭证，只属于本机
+app/session.json
+app/.mi.json
+app/.edge-profile/
+
+# go2rtc 运行时产物：配置里含账号凭证，日志与 pid 是本机状态
+go2rtc/go2rtc-app.yaml
+go2rtc/go2rtc.yaml
+go2rtc/go2rtc-app.log
+go2rtc/go2rtc-app.pid
+
+# 二进制与逆向资料不入库
+*.exe
+*.zip
+*.apk
+apk/
+逆向笔记-摄像头拉流.md
+
+# 系统与编辑器
+Thumbs.db
+Desktop.ini
+.DS_Store
