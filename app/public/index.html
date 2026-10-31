@@ -81,6 +81,12 @@
           <button type="button" id="modeLiveBtn" class="active">实时</button>
           <button type="button" id="modeReplayBtn">回放</button>
         </div>
+        <div class="segmented quality" id="qualitySwitch" role="group" aria-label="画质">
+          <button type="button" data-quality="auto" class="active">自动</button>
+          <button type="button" data-quality="sd">360p</button>
+          <button type="button" data-quality="max" id="qualityMaxBtn">2K</button>
+        </div>
+        <span class="quality-note" id="qualityNote" role="status" aria-live="polite"></span>
         <button class="ghost" id="reloadBtn">重新连接</button>
         <button class="ghost" id="closePlayer">关闭</button>
       </div>
@@ -91,7 +97,7 @@
       <section class="card motor-panel" id="motorPanel" aria-labelledby="motorTitle" hidden>
         <div>
           <h3 id="motorTitle">云台控制</h3>
-          <p class="hint">控制镜头 1，镜头 2 保持固定。点击按钮或按键盘 ↑ ↓ ← → 转动，发送后请等待画面变化，避免连续操作。</p>
+          <p class="hint">控制镜头 1，镜头 2 保持固定。<b>按住</b>方向按钮或键盘 ↑ ↓ ← → 会持续转动，松手即停；画面有延迟，按自己的节奏来。</p>
           <p class="hint" id="motorStatus" role="status" aria-live="polite">连接镜头 1 后可发送转动指令。</p>
         </div>
         <div class="direction-pad" role="group" aria-label="云台方向">

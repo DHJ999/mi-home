@@ -36,7 +36,10 @@ const track = $('track');
 let cameras = [];
 let current = null;
 let players = [];
-let motorBusy = false;
+let motorPending = 0;
+let motorHold = null;
+let quality = 'auto';
+let qualityBusy = false;
 let viewGeneration = 0;
 let mode = 'live';
 let liveSuspended = false;
@@ -377,8 +380,10 @@ function updatePlayerState() {
   streamState.className = 'pill' + (playing ? ' on' : failed === players.length && players.length ? ' off' : '');
   $('reloadBtn').disabled = players.some((entry) => entry.state === 'connecting');
   for (const button of motorButtons) {
-    button.disabled = motorBusy || !current?.ptz || !mainIsLive();
+    // 按住转动期间不能把按钮禁掉，否则 pointerup 收不到，指针捕获也会丢
+    button.disabled = !current?.ptz || !mainIsLive();
   }
+  renderQualityChrome();
 }
 
 function setLensState(entry, state, text) {
@@ -422,7 +427,9 @@ function openPlayer(cam) {
   liveSuspended = false;
   $('playerTitle').textContent = cam.name || '摄像头';
   $('motorPanel').hidden = !cam.ptz;
-  $('motorStatus').textContent = '连接镜头 1 后可发送转动指令，点击后请等待画面变化。';
+  motorError = '';
+  setMotorStatus('连接镜头 1 后可发送转动指令。');
+  quality = loadQuality();
   videoGrid.classList.toggle('dual', cam.lenses.length === 2);
   $('modeReplayBtn').disabled = !replaySupported();
   $('modeReplayBtn').title = replaySupported() ? '' : '这台机型的存储卡回放尚未接通';
@@ -464,7 +471,7 @@ async function connectLens(entry) {
     const r = await api('/api/stream', {
       method: 'POST', signal: controller.signal,
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ did: camera.did, channel: entry.channel }),
+      body: JSON.stringify({ did: camera.did, channel: entry.channel, quality }),
     });
     if (!active()) return;
     const player = document.createElement('video-rtc');
@@ -512,38 +519,178 @@ function waitLensPlaying(entry, ms) {
 }
 
 function canMoveMotor() {
-  return Boolean(current?.ptz) && !motorBusy && mode === 'live' && mainIsLive();
+  return Boolean(current?.ptz) && mode === 'live' && mainIsLive();
 }
 
-async function moveMotor(direction) {
+// 云台长按：协议层只有单步 operation，没有「转多久」这个参数，米家 App 的持续转动
+// 就是按住期间不停补发单步指令。
+const MOTOR_INTERVAL = 220;
+// 卡键 / 触摸事件丢失时的兜底，最多连转 12 秒
+const MOTOR_MAX_HOLD = 12000;
+
+function setMotorStatus(text) {
+  $('motorStatus').textContent = text;
+}
+
+const MOTOR_IDLE_HINT = '已停止，按住方向按钮或键盘 ↑ ↓ ← → 可继续转动。';
+let motorError = '';
+
+function stopMotorHold() {
+  if (!motorHold) return;
+  clearTimeout(motorHold.timer);
+  clearTimeout(motorHold.guard);
+  motorHold.pad?.classList.remove('is-holding');
+  motorHold = null;
+  if (!motorPending) setMotorStatus(motorError || MOTOR_IDLE_HINT);
+  // 兜底：最后一条指令万一卡在网络里，1 秒后也把「正在转动」收掉
+  clearTimeout(stopMotorHold.settle);
+  stopMotorHold.settle = setTimeout(() => {
+    if (!motorHold) setMotorStatus(motorError || MOTOR_IDLE_HINT);
+  }, 1000);
+}
+
+function startMotorHold(direction, pad) {
+  if (motorHold || !direction) return;
   if (!canMoveMotor()) return;
+  motorError = '';
+  clearTimeout(stopMotorHold.settle);
+  motorHold = { direction, pad: pad || null, timer: null, guard: setTimeout(stopMotorHold, MOTOR_MAX_HOLD) };
+  pad?.classList.add('is-holding');
+  setMotorStatus('正在转动，松手即停…');
+  pumpMotor();
+}
+
+// 上一条落地再排下一条：网络一慢也不会把指令堆在队列里，松手立刻就能停住
+async function pumpMotor() {
+  if (!motorHold) return;
+  const direction = motorHold.direction;
+  await pressMotor(direction);
+  if (!motorHold || motorHold.direction !== direction) return;
+  motorHold.timer = setTimeout(pumpMotor, MOTOR_INTERVAL);
+}
+
+async function pressMotor(direction) {
+  if (!current) return;
   const camera = current;
   const generation = viewGeneration;
   const active = () => current === camera && viewGeneration === generation;
-  motorBusy = true;
-  updatePlayerState();
-  $('motorStatus').textContent = '正在发送云台指令…';
+  motorPending++;
   try {
     await api('/api/motor', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ did: camera.did, direction }),
     });
-    if (active()) $('motorStatus').textContent = '已发送转动指令，请观察画面；直播可能稍有延迟。';
   } catch (e) {
-    if (active()) $('motorStatus').textContent = e.message;
+    motorError = e.message;
+    stopMotorHold();
+    if (active()) setMotorStatus(e.message);
   } finally {
-    if (active()) {
-      motorBusy = false;
-      updatePlayerState();
-    }
+    motorPending--;
+    // 松手时最后一条可能还在飞，等它落地再把状态收干净
+    if (!motorPending && !motorHold && active()) setMotorStatus(motorError || MOTOR_IDLE_HINT);
   }
 }
 
 for (const button of motorButtons) {
-  button.onclick = () => {
-    if (button.disabled) return;
-    moveMotor(button.dataset.direction);
-  };
+  const direction = button.dataset.direction;
+  button.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || button.disabled) return;
+    e.preventDefault();
+    // 指针捕获：手指/鼠标滑出按钮范围也不会丢 pointerup
+    try { button.setPointerCapture(e.pointerId); } catch {}
+    startMotorHold(direction, button);
+  });
+  for (const type of ['pointerup', 'pointercancel']) {
+    button.addEventListener(type, stopMotorHold);
+  }
+  // 键盘聚焦在按钮上时，空格/回车会触发 click，这里不再走 click 逻辑
+  button.addEventListener('click', (e) => e.preventDefault());
+}
+window.addEventListener('pointerup', stopMotorHold);
+window.addEventListener('blur', stopMotorHold);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopMotorHold();
+});
+
+// ---------- 画质 ----------
+
+const QUALITY_KEY = 'mi-home-quality';
+const QUALITY_LABEL = { auto: '自动', sd: '360p', max: '最高画质' };
+
+function loadQuality() {
+  try {
+    const saved = localStorage.getItem(QUALITY_KEY);
+    return ['auto', 'sd', 'max'].includes(saved) ? saved : 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+function saveQuality(value) {
+  try { localStorage.setItem(QUALITY_KEY, value); } catch {}
+}
+
+function qualityMaxLabel() {
+  return current?.quality?.maxLabel || '2K';
+}
+
+function renderQualityChrome() {
+  const box = $('qualitySwitch');
+  if (!box) return;
+  $('qualityMaxBtn').textContent = qualityMaxLabel();
+  box.hidden = mode !== 'live' || !current;
+  for (const btn of box.querySelectorAll('[data-quality]')) {
+    btn.classList.toggle('active', btn.dataset.quality === quality);
+    btn.disabled = qualityBusy;
+  }
+}
+
+function noteQuality(text) {
+  const note = $('qualityNote');
+  if (!note) return;
+  note.textContent = text;
+  clearTimeout(noteQuality.timer);
+  noteQuality.timer = setTimeout(() => { note.textContent = ''; }, 4500);
+}
+
+// 画质是会话内的切换：go2rtc 把 videoquality 下发给摄像头，画面不断流，新档位从下一个关键帧生效
+async function changeQuality(next, { silent = false } = {}) {
+  if (!current || qualityBusy) return;
+  if (next === quality && !silent) return;
+  const camera = current;
+  const generation = viewGeneration;
+  const active = () => current === camera && viewGeneration === generation;
+  const previous = quality;
+  qualityBusy = true;
+  quality = next;
+  renderQualityChrome();
+  try {
+    await api('/api/quality', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ did: camera.did, quality: next }),
+    });
+    saveQuality(next);
+    if (active() && !silent) {
+      const label = next === 'max' ? qualityMaxLabel() : QUALITY_LABEL[next];
+      // 镜头 2 的档位只能建流时定，运行中切不动
+      const dual = (camera.lenses?.length || 0) > 1;
+      noteQuality(`已切到${label}，画面会在下一个关键帧生效` + (dual ? '；镜头 2 点「重试此镜头」后跟着变' : ''));
+    }
+  } catch (e) {
+    quality = previous;
+    // 静默补发（画面刚起来时）失败不打扰用户：可能是这个镜头的档位还没就绪
+    if (active() && !silent) {
+      noteQuality('切换画质失败：' + e.message);
+      modal('切换画质失败', e.message);
+    }
+  } finally {
+    qualityBusy = false;
+    if (active()) renderQualityChrome();
+  }
+}
+
+for (const btn of $('qualitySwitch').querySelectorAll('[data-quality]')) {
+  btn.addEventListener('click', () => changeQuality(btn.dataset.quality));
 }
 
 $('reloadBtn').onclick = () => {
@@ -557,6 +704,7 @@ $('reloadBtn').onclick = () => {
 };
 
 function closePlayer() {
+  stopMotorHold();
   viewGeneration++;
   if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
   if (mode === 'replay') saveMemory();
@@ -582,7 +730,8 @@ function closePlayer() {
   liveSuspended = false;
   destroyPlayer();
   current = null;
-  motorBusy = false;
+  motorPending = 0;
+  qualityBusy = false;
   replayView.hidden = true;
   liveView.hidden = false;
   $('dateRow').replaceChildren();
@@ -937,6 +1086,7 @@ function setModeChrome() {
   replayView.hidden = !isReplay;
   $('playerMeta').textContent = current ? `${current.model || ''}${isReplay ? ' · 存储卡回放' : ' · 实时画面'}` : '';
   $('reloadBtn').textContent = isReplay ? '重新定位' : '重新连接';
+  renderQualityChrome();
   if (isReplay) updateReplayChrome();
   else updatePlayerState();
 }
@@ -1590,6 +1740,8 @@ track.addEventListener('pointermove', (e) => {
 track.addEventListener('pointerup', () => finishDrag(false));
 track.addEventListener('pointercancel', () => finishDrag(true));
 
+const MOTOR_KEYS = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' };
+
 document.addEventListener('keydown', (e) => {
   if (playerView.hidden) return;
   const tag = e.target?.tagName || '';
@@ -1598,7 +1750,7 @@ document.addEventListener('keydown', (e) => {
     if (mode !== 'replay') return;
     e.preventDefault();
     togglePlay();
-  } else if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+  } else if (MOTOR_KEYS[e.key]) {
     if (mode === 'replay') {
       if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         e.preventDefault();
@@ -1606,15 +1758,23 @@ document.addEventListener('keydown', (e) => {
       }
       return;
     }
-    // 按住方向键会一连串发云台指令，一步一按更好控制
-    if (e.repeat || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     if (!$('modal').hidden || !canMoveMotor()) return;
     e.preventDefault();
-    moveMotor({ ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right' }[e.key]);
+    // 系统自带的按键重复不参与：按住由定时器统一补发，节奏才稳，松手也停得干净
+    if (e.repeat) return;
+    const direction = MOTOR_KEYS[e.key];
+    if (motorHold && motorHold.direction !== direction) stopMotorHold();
+    startMotorHold(direction);
   } else if (e.key === 'Escape' && !document.fullscreenElement) {
     if (mode === 'replay') exitReplayMode();
     else closePlayer();
   }
+});
+
+document.addEventListener('keyup', (e) => {
+  const direction = MOTOR_KEYS[e.key];
+  if (direction && motorHold?.direction === direction) stopMotorHold();
 });
 
 window.addEventListener('pagehide', () => {

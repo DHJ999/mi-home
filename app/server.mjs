@@ -6,7 +6,7 @@ import { exec } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { MiIOT, getMiIOT } from 'mi-service-lite';
 import { beginBrowserLogin, browserLoginState, browserLoginHookToken, ingestHookPayload } from './browser-login.mjs';
-import { ensureRunning, openCamera, moveCamera, listRecordings, stopPlayback, stop as stopGo2rtc } from './go2rtc.mjs';
+import { ensureRunning, openCamera, moveCamera, listRecordings, stopPlayback, stop as stopGo2rtc, setQuality, maxQualityOf, QUALITY_KINDS } from './go2rtc.mjs';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 process.chdir(ROOT);
@@ -88,6 +88,8 @@ function applyDevices(list) {
         ? [{ channel: '0', label: '镜头 1' }, { channel: '2', label: '镜头 2' }]
         : [{ channel: '0', label: '摄像头画面' }],
       ptz: d.model === 'isa.camera.hlmax',
+      // 画质档位：2.5K / 2K 由机型决定，前端用它改第三档按钮上的字
+      quality: { max: maxQualityOf(d.model), maxLabel: d.model === 'isa.camera.hlmax' ? '2.5K' : '2K' },
     }));
   return cameras;
 }
@@ -190,7 +192,7 @@ async function runVerifyAttempt() {
 }
 
 // 画面走小米云端的 cs2 P2P 通道，由本地 go2rtc 负责打洞和转码
-async function startStream(cam, channel, replay) {
+async function startStream(cam, channel, replay, quality = 'max') {
   const passToken = account?.pass?.passToken;
   if (!passToken) throw new Error('登录信息里没有云端凭证，请退出后重新登录');
   await ensureRunning(String(account.userId), passToken);
@@ -202,10 +204,28 @@ async function startStream(cam, channel, replay) {
     localip: cam.localip,
     channel,
     replay,
+    quality,
   });
 }
 
-const movingCameras = new Set();
+// 云台：go2rtc 的 motor 只是往 P2P 通道写一帧 UDP，不等摄像头回执，所以按住连发是安全的。
+// 这里按设备串成一条链，既保证同一台摄像头的指令按顺序落地，也不会因为叠加太多而积压。
+const motorChains = new Map();
+
+function queueMotor(did, direction) {
+  let entry = motorChains.get(did);
+  if (!entry) motorChains.set(did, entry = { tail: Promise.resolve(), pending: 0 });
+  // 松开手指时最后几帧可能还在路上，积到 4 条就丢掉多余的那几下
+  if (entry.pending >= 4) return null;
+  entry.pending++;
+  const run = entry.tail.then(() => moveCamera(did, direction), () => moveCamera(did, direction));
+  entry.tail = run.catch(() => {});
+  run.finally(() => {
+    entry.pending--;
+    if (entry.pending === 0 && motorChains.get(did) === entry) motorChains.delete(did);
+  }).catch(() => {});
+  return run;
+}
 
 async function serveStatic(res, pathname) {
   const file = path.join(PUB, pathname === '/' ? 'index.html' : pathname.slice(1));
@@ -281,7 +301,7 @@ const server = http.createServer(async (req, res) => {
       if (!account) return json(res, 401, { error: '未登录' });
       return json(res, 200, { cameras: await listCameras() });
     }
-    if (req.method === 'POST' && ['/api/stream', '/api/motor', '/api/recordings', '/api/playback', '/api/playback/stop'].includes(url.pathname)) {
+    if (req.method === 'POST' && ['/api/stream', '/api/motor', '/api/quality', '/api/recordings', '/api/playback', '/api/playback/stop'].includes(url.pathname)) {
       if (!account) return json(res, 401, { error: '未登录' });
       if (req.headers.origin && req.headers.origin !== `http://127.0.0.1:${PORT}`) {
         return json(res, 403, { error: '不允许其他网站控制摄像头' });
@@ -341,20 +361,33 @@ const server = http.createServer(async (req, res) => {
         if (!cam.lenses.some((lens) => lens.channel === channel)) {
           return json(res, 400, { error: '这台摄像头没有所选镜头' });
         }
-        return json(res, 200, await startStream(cam, channel));
+        const quality = body.quality ?? 'max';
+        if (!QUALITY_KINDS.includes(quality)) {
+          return json(res, 400, { error: '无效的画质档位' });
+        }
+        return json(res, 200, await startStream(cam, channel, undefined, quality));
+      }
+      if (url.pathname === '/api/quality') {
+        if (!QUALITY_KINDS.includes(body.quality)) {
+          return json(res, 400, { error: '无效的画质档位' });
+        }
+        // 只切镜头 1：go2rtc 的 SetQuality 固定发 videoquality（主通道），
+        // 镜头 2 的档位只能建流时用 subtype 定，这里硬切会报错还改不动。
+        try {
+          await setQuality(cam.did, cam.model, body.quality, '0');
+        } catch (e) {
+          return json(res, 502, { error: e.message });
+        }
+        return json(res, 200, { ok: true, quality: body.quality });
       }
       if (!cam.ptz) return json(res, 400, { error: '尚未接入这台摄像头的云台控制' });
       if (!['up', 'down', 'left', 'right'].includes(body.direction)) {
         return json(res, 400, { error: '无效的云台方向' });
       }
-      if (movingCameras.has(cam.did)) return json(res, 409, { error: '上一条云台指令尚未完成' });
-      movingCameras.add(cam.did);
-      try {
-        await moveCamera(cam.did, body.direction);
-        return json(res, 200, { ok: true });
-      } finally {
-        movingCameras.delete(cam.did);
-      }
+      const run = queueMotor(cam.did, body.direction);
+      if (!run) return json(res, 200, { ok: true, skipped: true });
+      await run;
+      return json(res, 200, { ok: true });
     }
     if (req.method === 'POST' && url.pathname === '/api/logout') {
       cancelVerify();

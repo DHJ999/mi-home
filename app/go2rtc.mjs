@@ -12,6 +12,31 @@ const FFMPEG = 'D:/ffmpeg/bin/ffmpeg.exe';
 const API = 'http://127.0.0.1:1984';
 // 播放器页面在 1990，向 1984 建 WebSocket 时会被 go2rtc 做来源校验
 const APP_ORIGIN = 'http://127.0.0.1:1990';
+
+// 米家 miss 协议的 videoquality 档位，实测于两台机器（抓帧量分辨率）：
+//   hlmax（CW500 双摄）0 档 2560×1440 / 1 档 640×360 / 2 档只有 640×360 / 3 档 2560×1440
+//   hlc7（标准版 2K）  0 档 2304×1296 / 1 档 640×360 / 2、3 档 2304×1296
+// 所以 2.5K 必须落在 3 档，而 0 档（摄像头自适应）在两台上都给到机身上限，可以直接当「自动」。
+const MAX_QUALITY = { 'isa.camera.hlmax': '3', 'isa.camera.hlc7': '2' };
+export const QUALITY_KINDS = ['auto', 'sd', 'max'];
+
+export function maxQualityOf(model) {
+  return MAX_QUALITY[model] || '2';
+}
+
+// UI 三档 → 协议档位。
+// 建流走 buildSubtype：只区分标清和「机型上限」，实测这两个档位的建链最稳。
+// 运行中切换走 qualityLevel：auto 才真正交给摄像头自适应（0 档）。
+function buildSubtype(model, quality) {
+  if (quality === 'sd') return '1';
+  return maxQualityOf(model);
+}
+
+function qualityLevel(model, quality) {
+  if (quality === 'sd') return '1';
+  if (quality === 'auto') return '0';
+  return maxQualityOf(model);
+}
 const RTSP = 'rtsp://127.0.0.1:8554';
 
 let proc = null;
@@ -162,7 +187,7 @@ export async function stopPlayback(did) {
   await stopReplayStreams(did);
 }
 
-export async function openCamera({ userId, region, did, model, localip, channel = '0', replay }) {
+export async function openCamera({ userId, region, did, model, localip, channel = '0', replay, quality = 'max' }) {
   if (!['0', '2'].includes(channel) || (channel === '2' && model !== 'isa.camera.hlmax')) {
     throw new Error('这台摄像头没有所选镜头');
   }
@@ -170,8 +195,9 @@ export async function openCamera({ userId, region, did, model, localip, channel 
   if (replay) await stopLiveStreams(did);
   const name = 'cam' + did + (channel === '0' ? '' : 'c2') + (replay ? `r${replay.start}o${replay.offset}` : '');
   const query = new URLSearchParams({ did, model, channel });
-  // CW500 的默认档只有 640×360，2.5K 必须显式要 3 档
-  if (!replay && model === 'isa.camera.hlmax') query.set('subtype', '3');
+  // 建流就按用户选的档位要画面：hlmax 的默认档只有 640×360，2.5K 必须显式要 3 档；
+  // 镜头 2 的运行中切换上游只发主通道参数，只能靠建流时定下来。
+  if (!replay) query.set('subtype', buildSubtype(model, quality));
   if (replay) {
     query.set('replay', String(replay.start));
     query.set('offset', String(replay.offset));
@@ -195,13 +221,29 @@ export async function moveCamera(did, direction) {
   const query = new URLSearchParams({ src: 'cam' + did, motor: direction, via: 'p2p' });
   let r;
   try {
-    r = await request('/api/xiaomi/ctl?' + query, { method: 'POST' }, 15000);
+    r = await request('/api/xiaomi/ctl?' + query, { method: 'POST' }, 8000);
   } catch {
-    throw new Error('云台请求超时，结果尚未确认，请先观察画面，避免连续点击');
+    throw new Error('云台请求超时，请确认镜头 1 仍在播放后再试');
   }
   if (r.status === 409) throw new Error('云台连接已断开，请先重连镜头 1');
   if (!r.ok || r.body.toString().trim() !== 'ok') {
     throw new Error('云台指令未能发送，请确认镜头 1 已连接后重试');
+  }
+}
+
+// 运行中切画质：走 go2rtc 的 ctl，会话不断开，新档位从摄像头的下一个关键帧生效。
+export async function setQuality(did, model, quality, channel = '0') {
+  const src = 'cam' + did + (channel === '0' ? '' : 'c2');
+  const query = new URLSearchParams({ src, quality: qualityLevel(model, quality) });
+  let r;
+  try {
+    r = await request('/api/xiaomi/ctl?' + query, { method: 'POST' }, 10000);
+  } catch {
+    throw new Error('切换画质超时，请确认画面仍在播放后再试');
+  }
+  if (r.status === 409) throw new Error('这个镜头还没连上，无法切换画质');
+  if (!r.ok || r.body.toString().trim() !== 'ok') {
+    throw new Error('摄像头没有接受画质切换，请保持画面播放后再试');
   }
 }
 
